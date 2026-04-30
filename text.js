@@ -9,14 +9,17 @@ function charWidth(ch) {
     (code >= 0x1100 && code <= 0x115F) ||
     (code >= 0x2E80 && code <= 0x303E) ||
     (code >= 0x3040 && code <= 0x33BF) ||
-    (code >= 0x3400 && code <= 0xA4CF) ||
+    (code >= 0x3400 && code <= 0x4DBF) ||
+    (code >= 0x4E00 && code <= 0xA4CF) ||
+    (code >= 0xA960 && code <= 0xA97F) ||
     (code >= 0xAC00 && code <= 0xD7FF) ||
     (code >= 0xF900 && code <= 0xFAFF) ||
     (code >= 0xFE30 && code <= 0xFE6F) ||
     (code >= 0xFF01 && code <= 0xFF60) ||
     (code >= 0xFFE0 && code <= 0xFFE6) ||
     (code >= 0x1F000 && code <= 0x1FFFF) ||
-    (code >= 0x20000 && code <= 0x3FFFF)
+    (code >= 0x20000 && code <= 0x2FFFF) ||
+    (code >= 0x30000 && code <= 0x3FFFF)
   ) return 2;
   return 1;
 }
@@ -75,9 +78,7 @@ function screenColToCharIdx(line, screenCol) {
   let i = 0;
   for (const ch of line) {
     if (w >= screenCol) break;
-    const cw = charWidth(ch);
-    if (w + cw > screenCol) break;
-    w += cw;
+    w += charWidth(ch);
     i += ch.length;
   }
   return i;
@@ -111,14 +112,22 @@ function wordRight(line, col) {
   return i;
 }
 
+const WORD_SEPARATORS = '`~!@#$%^&*()-=+[{]}\\|;:\'",.<>/?';
+
+function charClass(ch) {
+  if (ch === ' ' || ch === '\t') return 1;
+  if (WORD_SEPARATORS.indexOf(ch) >= 0) return 2;
+  return 3;
+}
+
 function wordBoundsAt(line, pos) {
   if (!line) return { start: 0, end: 0 };
   pos = Math.max(0, Math.min(pos, line.length - 1));
-  const isWord = /[\w$]/.test(line[pos]);
+  const cls = charClass(line[pos]);
   let start = pos;
   let end = pos;
-  while (start > 0 && /[\w$]/.test(line[start - 1]) === isWord) start--;
-  while (end < line.length && /[\w$]/.test(line[end]) === isWord) end++;
+  while (start > 0 && charClass(line[start - 1]) === cls) start--;
+  while (end < line.length && charClass(line[end]) === cls) end++;
   return { start, end };
 }
 

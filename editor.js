@@ -97,6 +97,7 @@ function markDirty() {
 
 function undo() {
   if (!state.undoStack.length || state.readonly) return;
+  state.scrollFreed = false;
   state.redoStack.push({
     lines: state.editLines.slice(),
     cursorRow: state.cursorRow,
@@ -117,6 +118,7 @@ function undo() {
 
 function redo() {
   if (!state.redoStack.length || state.readonly) return;
+  state.scrollFreed = false;
   state.undoStack.push({
     lines: state.editLines.slice(),
     cursorRow: state.cursorRow,
@@ -137,6 +139,7 @@ function redo() {
 
 function insertText(text, type) {
   if (state.readonly || !state.openPath) return;
+  state.scrollFreed = false;
   snapshot(type || 'insert');
   deleteSelectionOnly();
   text = String(text || '').replace(/\r/g, '');
@@ -161,6 +164,7 @@ function insertText(text, type) {
 
 function deleteBackward() {
   if (state.readonly || !state.openPath) return;
+  state.scrollFreed = false;
   snapshot('delete');
   if (deleteSelectionOnly()) {
     markDirty();
@@ -182,6 +186,7 @@ function deleteBackward() {
 
 function deleteForward() {
   if (state.readonly || !state.openPath) return;
+  state.scrollFreed = false;
   snapshot('delete');
   if (deleteSelectionOnly()) {
     markDirty();
@@ -198,6 +203,7 @@ function deleteForward() {
 }
 
 function moveCursor(row, col, selecting) {
+  state.scrollFreed = false;
   if (selecting) startSelection();
   else clearSelection();
   state.cursorRow = Math.max(0, Math.min(row, state.editLines.length - 1));
@@ -206,14 +212,19 @@ function moveCursor(row, col, selecting) {
 }
 
 function moveVertical(delta, selecting) {
-  if (state.desiredCol == null) state.desiredCol = state.cursorCol;
   const row = Math.max(0, Math.min(state.cursorRow + delta, state.editLines.length - 1));
-  const col = Math.min(state.desiredCol, state.editLines[row].length);
+  const col = Math.min(state.cursorCol, state.editLines[row].length);
   moveCursor(row, col, selecting);
 }
 
 function moveHorizontal(delta, selecting) {
   state.desiredCol = null;
+  if (!selecting && hasSelection()) {
+    const r = getSelectionRange();
+    if (delta < 0) moveCursor(r.startRow, r.startCol, false);
+    else moveCursor(r.endRow, r.endCol, false);
+    return;
+  }
   if (delta < 0) {
     if (state.cursorCol > 0) moveCursor(state.cursorRow, state.cursorCol - 1, selecting);
     else if (state.cursorRow > 0) moveCursor(state.cursorRow - 1, state.editLines[state.cursorRow - 1].length, selecting);
@@ -237,6 +248,7 @@ function moveWord(delta, selecting) {
 }
 
 function selectAll() {
+  state.scrollFreed = false;
   state.selAnchorRow = 0;
   state.selAnchorCol = 0;
   state.cursorRow = state.editLines.length - 1;
@@ -271,6 +283,7 @@ async function openFile(filePath, opts) {
     state.cursorCol = 0;
     state.scrollY = 0;
     state.scrollX = 0;
+    state.scrollFreed = false;
     state.dirty = false;
     state.readonly = true;
     state.binary = !!result.binary;
@@ -290,6 +303,7 @@ async function openFile(filePath, opts) {
   state.desiredCol = null;
   state.scrollY = 0;
   state.scrollX = 0;
+  state.scrollFreed = false;
   state.dirty = false;
   state.readonly = false;
   state.binary = false;
@@ -343,6 +357,7 @@ async function closeFile(force) {
   state.cursorCol = 0;
   state.scrollY = 0;
   state.scrollX = 0;
+  state.scrollFreed = false;
   state.dirty = false;
   state.readonly = false;
   state.binary = false;

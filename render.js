@@ -10,6 +10,12 @@ const {
 } = require('./text');
 const { getSelectionRange, hasSelection } = require('./editor');
 const { highlightLine, getLanguage } = require('./highlighter');
+const {
+  CURSOR_PALETTE,
+  renderCursorPixels,
+  encodeSixel,
+  encodeClearSixel,
+} = require('./sixel');
 
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
@@ -19,6 +25,10 @@ function fit(text, width) {
   if (width <= 0) return '';
   const truncated = truncateAnsi(String(text || ''), width);
   return padRight(truncated, width);
+}
+
+function resetInlineStyle() {
+  return ansi.noBold + ansi.noItalic + ansi.noUnderline + ansi.noInverse + ansi.fg.default;
 }
 
 function render() {
@@ -77,6 +87,7 @@ function render() {
   out.push(ansi.moveTo(bottomSepRow, 1) + renderBottomSeparator(layout));
   out.push(ansi.moveTo(statusRow, 1) + renderStatus(cols));
   process.stdout.write(out.join(''));
+  renderEditorCursorOverlay();
 }
 
 function computePanelLayout(cols) {
@@ -217,10 +228,11 @@ function renderTreeLines(width, height) {
     const indent = '  '.repeat(Math.max(0, entry.depth));
     const marker = entry.isDir ? (entry.expanded ? '- ' : '+ ') : '  ';
     const nameColor = entry.isDir ? colors.treeDir : colors.treeFile;
-    const openMark = open ? colors.saved + '>' + ansi.reset : ' ';
-    let line = openMark + indent + marker + nameColor + entry.name + ansi.reset;
+    const inlineReset = resetInlineStyle();
+    const openMark = open ? colors.saved + '>' + inlineReset : ' ';
+    let line = openMark + indent + marker + nameColor + entry.name + inlineReset;
     if (!entry.isDir && contentW > 28) {
-      const meta = entry.size ? colors.dim + ' ' + formatSize(entry.size) + ansi.reset : '';
+      const meta = entry.size ? colors.dim + ' ' + formatSize(entry.size) + inlineReset : '';
       const free = contentW - stringWidth(entry.name) - stringWidth(indent) - 5;
       if (free > 8) line += meta;
     }
@@ -238,13 +250,17 @@ function keepEditorCursorVisible(editorW, height) {
   const line = state.editLines[state.cursorRow] || '';
   state.cursorCol = clamp(state.cursorCol, 0, line.length);
 
-  if (state.cursorRow < state.scrollY) state.scrollY = state.cursorRow;
-  if (state.cursorRow >= state.scrollY + height) state.scrollY = state.cursorRow - height + 1;
+  if (!state.dragging && !state.scrollFreed) {
+    if (state.cursorRow < state.scrollY) state.scrollY = state.cursorRow;
+    if (state.cursorRow >= state.scrollY + height) state.scrollY = state.cursorRow - height + 1;
+  }
   state.scrollY = clamp(state.scrollY, 0, Math.max(0, state.editLines.length - height));
 
   const cursorX = stringWidth(line.substring(0, state.cursorCol));
-  if (cursorX < state.scrollX) state.scrollX = cursorX;
-  if (cursorX >= state.scrollX + contentW) state.scrollX = cursorX - contentW + 1;
+  if (!state.dragging && !state.scrollFreed) {
+    if (cursorX < state.scrollX) state.scrollX = cursorX;
+    if (cursorX >= state.scrollX + contentW) state.scrollX = cursorX - contentW + 1;
+  }
   state.scrollX = Math.max(0, state.scrollX);
 }
 
@@ -277,11 +293,9 @@ function renderEditorLines(width, height) {
 
     const lineNo = String(lineIdx + 1).padStart(gutterW - 1, ' ') + ' ';
     const gutter = colors.lineNo + lineNo + '\u2502' + ansi.reset + ' ';
-    const current = lineIdx === state.cursorRow;
     let content = renderCodeContent(lineIdx, contentW);
     let full = gutter + content;
     full = fit(full, panelW);
-    if (current && state.focus === 'editor') full = colors.active + full + ansi.reset;
     lines.push(full + renderScrollbarCell(row, height, state.scrollY, maxScroll));
   }
   return lines;
@@ -293,13 +307,12 @@ function renderCodeContent(lineIdx, width) {
   const segment = sanitizeDisplayText(slice.text);
   const leading = ' '.repeat(slice.leftPad);
   const selected = selectionTouchesLine(lineIdx);
-  const current = lineIdx === state.cursorRow;
+  const highlighted = highlightLine(segment, state.openPath);
 
-  if (selected || current) {
-    return fit(leading + renderMarkedSegment(segment, lineIdx, slice.start), width);
+  if (selected) {
+    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start), width);
   }
 
-  const highlighted = highlightLine(segment, state.openPath);
   return fit(leading + highlighted, width);
 }
 
@@ -309,23 +322,60 @@ function selectionTouchesLine(lineIdx) {
   return lineIdx >= r.startRow && lineIdx <= r.endRow;
 }
 
-function renderMarkedSegment(segment, lineIdx, startChar) {
+function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar) {
   const sel = getSelectionRange();
   let out = '';
-  for (let i = 0; i <= segment.length; i++) {
-    const absolute = startChar + i;
-    const atCursor = lineIdx === state.cursorRow && absolute === state.cursorCol && !hasSelection();
-    if (i === segment.length) {
-      if (atCursor) out += ansi.inverse + ' ' + ansi.reset;
-      break;
+  let plainOffset = 0;
+  let i = 0;
+
+  while (i < highlighted.length) {
+    if (highlighted[i] === '\x1b') {
+      const m = highlighted.substring(i).match(/^\x1b\[[0-9;]*[A-Za-z]/);
+      if (m) {
+        out += m[0];
+        i += m[0].length;
+        continue;
+      }
     }
-    const ch = segment[i];
+
+    const cp = highlighted.codePointAt(i);
+    const ch = String.fromCodePoint(cp);
+    const absolute = startChar + plainOffset;
     const selected = sel && isSelected(lineIdx, absolute, sel);
-    if (atCursor) out += ansi.inverse + ch + ansi.reset;
-    else if (selected) out += ansi.inverse + ch + ansi.reset;
+    if (selected) out += ansi.inverse + ch + ansi.noInverse;
     else out += ch;
+    i += ch.length;
+    plainOffset += ch.length;
   }
+
   return out;
+}
+
+function renderEditorCursorOverlay() {
+  if (!state.openPath || state.focus !== 'editor') return;
+  if (state.cellW <= 0 || state.cellH <= 0) return;
+
+  const layout = state.layout;
+  const gutterW = layout.gutterW;
+  const contentW = Math.max(1, layout.editorW - 1 - gutterW - 2);
+  const cursorDisplayCol = stringWidth((state.editLines[state.cursorRow] || '').substring(0, state.cursorCol));
+  const row = layout.bodyTop + (state.cursorRow - state.scrollY);
+  const col = layout.editorCol + gutterW + 2 + (cursorDisplayCol - state.scrollX);
+  const visible = row >= layout.bodyTop &&
+    row < layout.bodyTop + layout.bodyH &&
+    col >= layout.editorCol + gutterW + 2 &&
+    col < layout.editorCol + gutterW + 2 + contentW;
+
+  if (!visible) return;
+
+  if (!state.cursorBlinkOn) {
+    process.stdout.write(ansi.moveTo(row, col) + encodeClearSixel(state.cellW, state.cellH));
+    return;
+  }
+
+  const pixels = renderCursorPixels(state.cellW, state.cellH);
+  const sixel = encodeSixel(pixels, state.cellW, state.cellH, CURSOR_PALETTE);
+  process.stdout.write(ansi.moveTo(row, col) + sixel);
 }
 
 function isSelected(row, col, sel) {

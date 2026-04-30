@@ -32,7 +32,7 @@ const {
   closeFile,
 } = require('./editor');
 const { render } = require('./render');
-const { screenColToCharIdx } = require('./text');
+const { screenColToCharIdx, wordBoundsAt } = require('./text');
 
 let currentMouseShape = 'default';
 let cursorApiWarningShown = false;
@@ -279,6 +279,7 @@ async function handleTreeKey(key) {
 }
 
 async function handleEditorKey(key) {
+  state.scrollFreed = false;
   if (key === '\x02') {
     toggleTreePanel();
     return;
@@ -314,8 +315,8 @@ async function handleEditorKey(key) {
   if (key === CSI + 'F' || key === CSI + '4~') { moveCursor(state.cursorRow, state.editLines[state.cursorRow].length, false); render(); return; }
   if (key === CSI + '1;2H') { moveCursor(state.cursorRow, 0, true); render(); return; }
   if (key === CSI + '1;2F') { moveCursor(state.cursorRow, state.editLines[state.cursorRow].length, true); render(); return; }
-  if (key === CSI + '5~') { moveVertical(-Math.max(1, state.layout.bodyH - 2), false); render(); return; }
-  if (key === CSI + '6~') { moveVertical(Math.max(1, state.layout.bodyH - 2), false); render(); return; }
+  if (key === CSI + '5~') { moveVertical(-Math.max(1, state.layout.bodyH), false); render(); return; }
+  if (key === CSI + '6~') { moveVertical(Math.max(1, state.layout.bodyH), false); render(); return; }
   if (key === CSI + '3~') { deleteForward(); render(); return; }
   if (key === '\x7f' || key === '\b') { deleteBackward(); render(); return; }
   if (key === '\r' || key === '\n') { insertText('\n', 'newline'); render(); return; }
@@ -367,23 +368,53 @@ async function handleMouseData(data) {
 
   updateCursorForCell(cx, cy);
 
-  if (wheel && pressed) {
-    const delta = btn === 0 ? -3 : 3;
-    if (cx <= state.layout.treeW) {
-      state.focus = 'tree';
-      state.treeCursor = Math.max(0, Math.min(Math.max(0, state.treeEntries.length - 1), state.treeCursor + delta));
-    } else {
-      state.focus = 'editor';
-      if (state.openPath) moveVertical(delta, false);
+  if (!pressed && !wheel) {
+    const wasDragging = state.dragging;
+    state.mouseDown = false;
+    state.dragging = null;
+    state.panDragStart = null;
+    if (wasDragging === 'editor-scrollbar' || wasDragging === 'pan') {
+      state.scrollFreed = true;
+      render();
     }
+    updateCursorForCell(cx, cy);
+    return true;
+  }
+
+  if (motion && state.dragging === 'pan' && state.panDragStart) {
+    const deltaY = cy - state.panDragStart.y;
+    const deltaX = cx - state.panDragStart.x;
+    state.scrollY = Math.max(0, Math.min(getMaxEditorScroll(), state.panDragStart.scrollY - deltaY));
+    state.scrollX = Math.max(0, state.panDragStart.scrollX - deltaX);
     render();
     return true;
   }
 
-  if (!pressed) {
-    state.mouseDown = false;
-    state.dragging = null;
-    updateCursorForCell(cx, cy);
+  if (btn === 1 && pressed && !motion && !wheel && state.openPath && isEditorCell(cx, cy)) {
+    state.focus = 'editor';
+    state.dragging = 'pan';
+    state.panDragStart = {
+      x: cx,
+      y: cy,
+      scrollY: state.scrollY,
+      scrollX: state.scrollX,
+    };
+    return true;
+  }
+
+  if (wheel && pressed) {
+    const delta = btn === 0 ? -3 : 3;
+    if (!state.treeCollapsed && cx <= state.layout.treeW) {
+      state.focus = 'tree';
+      state.treeCursor = Math.max(0, Math.min(Math.max(0, state.treeEntries.length - 1), state.treeCursor + delta));
+    } else if (!state.editorCollapsed && cx >= state.layout.editorCol) {
+      state.focus = 'editor';
+      if (state.openPath) {
+        state.scrollFreed = true;
+        state.scrollY = Math.max(0, Math.min(getMaxEditorScroll(), state.scrollY + delta));
+      }
+    }
+    render();
     return true;
   }
 
@@ -395,7 +426,7 @@ async function handleMouseData(data) {
   }
 
   if (motion && state.mouseDown && state.focus === 'editor') {
-    setEditorCursorFromMouse(cx, cy, true);
+    dragEditorCursorFromMouse(cx, cy);
     render();
     return true;
   }
@@ -500,6 +531,18 @@ function setDividerFromMouse(cx) {
   state.editorCollapsed = false;
 }
 
+function getMaxEditorScroll() {
+  return Math.max(0, state.editLines.length - state.layout.bodyH);
+}
+
+function isEditorCell(cx, cy) {
+  return !state.editorCollapsed &&
+    cy >= state.layout.bodyTop &&
+    cy < state.layout.bodyTop + state.layout.bodyH &&
+    cx >= state.layout.editorCol &&
+    cx < state.layout.editorScrollCol;
+}
+
 function setScrollFromMouse(target, cy) {
   const row = Math.max(0, Math.min(state.layout.bodyH - 1, cy - state.layout.bodyTop));
   const denom = Math.max(1, state.layout.bodyH - 1);
@@ -514,8 +557,7 @@ function setScrollFromMouse(target, cy) {
     const maxScroll = Math.max(0, state.editLines.length - state.layout.bodyH);
     if (maxScroll <= 0) return;
     state.scrollY = Math.round((row / denom) * maxScroll);
-    state.cursorRow = Math.max(0, Math.min(state.editLines.length - 1, state.scrollY));
-    state.cursorCol = Math.max(0, Math.min(state.cursorCol, (state.editLines[state.cursorRow] || '').length));
+    state.scrollFreed = true;
   }
 }
 
@@ -536,20 +578,128 @@ async function clickTree(cy) {
 
 function clickEditor(cx, cy) {
   state.focus = 'editor';
+  if (!state.openPath) {
+    render();
+    return;
+  }
+  state.scrollFreed = false;
   state.mouseDown = true;
-  setEditorCursorFromMouse(cx, cy, false);
+  const pos = editorPositionFromMouse(cx, cy);
+  const now = Date.now();
+  if (state.lastClickPane === 'editor' && now - state.lastClickTime < 400 &&
+      state.lastClickRow === pos.row && Math.abs(state.lastClickCol - pos.col) <= 1) {
+    state.clickCount = Math.min(3, state.clickCount + 1);
+  } else {
+    state.clickCount = 1;
+  }
+  state.lastClickPane = 'editor';
+  state.lastClickTime = now;
+  state.lastClickRow = pos.row;
+  state.lastClickCol = pos.col;
+  state.lastClickIndex = -1;
+
+  if (state.clickCount === 3) {
+    selectEditorLine(pos.row);
+  } else if (state.clickCount === 2) {
+    selectEditorWord(pos.row, pos.col);
+  } else {
+    state.dragMode = 0;
+    moveCursor(pos.row, pos.col, false);
+  }
   render();
 }
 
-function setEditorCursorFromMouse(cx, cy, selecting) {
-  if (!state.openPath) return;
+function editorPositionFromMouse(cx, cy) {
+  if (!state.openPath) return { row: 0, col: 0 };
   const row = state.scrollY + (cy - state.layout.bodyTop);
   const clampedRow = Math.max(0, Math.min(row, state.editLines.length - 1));
   const contentStart = state.layout.editorCol + state.layout.gutterW + 2;
   const screenCol = Math.max(0, Math.min(cx, state.layout.editorScrollCol - 1) - contentStart);
   const actualCol = state.scrollX + screenCol;
   const col = screenColToCharIdx(state.editLines[clampedRow] || '', actualCol);
-  moveCursor(clampedRow, col, selecting);
+  return {
+    row: clampedRow,
+    col: Math.max(0, Math.min(col, (state.editLines[clampedRow] || '').length)),
+  };
+}
+
+function selectEditorWord(row, col) {
+  const line = state.editLines[row] || '';
+  const wb = wordBoundsAt(line, Math.min(col, Math.max(0, line.length - 1)));
+  state.selAnchorRow = row;
+  state.selAnchorCol = wb.start;
+  state.cursorRow = row;
+  state.cursorCol = wb.end;
+  state.dragMode = 2;
+  state.dragOriginStartRow = row;
+  state.dragOriginStartCol = wb.start;
+  state.dragOriginEndRow = row;
+  state.dragOriginEndCol = wb.end;
+}
+
+function selectEditorLine(row) {
+  const line = state.editLines[row] || '';
+  const cursorRow = row < state.editLines.length - 1 ? row + 1 : row;
+  const cursorCol = row < state.editLines.length - 1 ? 0 : line.length;
+  state.selAnchorRow = row;
+  state.selAnchorCol = 0;
+  state.cursorRow = cursorRow;
+  state.cursorCol = cursorCol;
+  state.dragMode = 3;
+  state.dragOriginStartRow = row;
+  state.dragOriginStartCol = 0;
+  state.dragOriginEndRow = cursorRow;
+  state.dragOriginEndCol = cursorCol;
+}
+
+function dragEditorCursorFromMouse(cx, cy) {
+  if (!state.openPath) return;
+  state.scrollFreed = false;
+  const pos = editorPositionFromMouse(cx, cy);
+
+  if (state.dragMode === 2) {
+    const line = state.editLines[pos.row] || '';
+    const wb = wordBoundsAt(line, Math.min(pos.col, Math.max(0, line.length - 1)));
+    const forward = pos.row > state.dragOriginEndRow ||
+      (pos.row === state.dragOriginEndRow && pos.col >= state.dragOriginEndCol);
+    if (forward) {
+      state.selAnchorRow = state.dragOriginStartRow;
+      state.selAnchorCol = state.dragOriginStartCol;
+      state.cursorRow = pos.row;
+      state.cursorCol = wb.end;
+    } else {
+      state.selAnchorRow = state.dragOriginEndRow;
+      state.selAnchorCol = state.dragOriginEndCol;
+      state.cursorRow = pos.row;
+      state.cursorCol = wb.start;
+    }
+  } else if (state.dragMode === 3) {
+    const forward = pos.row >= state.dragOriginEndRow;
+    if (forward) {
+      state.selAnchorRow = state.dragOriginStartRow;
+      state.selAnchorCol = state.dragOriginStartCol;
+      if (pos.row < state.editLines.length - 1) {
+        state.cursorRow = pos.row + 1;
+        state.cursorCol = 0;
+      } else {
+        state.cursorRow = pos.row;
+        state.cursorCol = (state.editLines[pos.row] || '').length;
+      }
+    } else {
+      state.selAnchorRow = state.dragOriginEndRow;
+      state.selAnchorCol = state.dragOriginEndCol;
+      state.cursorRow = pos.row;
+      state.cursorCol = 0;
+    }
+  } else {
+    moveCursor(pos.row, pos.col, true);
+  }
+
+  if (cy <= state.layout.bodyTop && state.scrollY > 0) {
+    state.scrollY = Math.max(0, state.scrollY - 1);
+  } else if (cy >= state.layout.bodyTop + state.layout.bodyH - 1 && state.scrollY < getMaxEditorScroll()) {
+    state.scrollY = Math.min(getMaxEditorScroll(), state.scrollY + 1);
+  }
 }
 
 async function promptNewFile() {
@@ -776,7 +926,7 @@ async function handleDialogResult(params) {
 
 function cleanup() {
   setMouseShape('default');
-  process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
+  process.stdout.write(ansi.blockCursor + ansi.showCursor + ansi.reset + ansi.clear);
 }
 
 module.exports = {

@@ -32,6 +32,7 @@ const {
 
 let watcherTimer = null;
 let watcherBusy = false;
+let blinkTimer = null;
 
 async function getInitialPath() {
   const params = hecaton.initialState && hecaton.initialState.params;
@@ -114,10 +115,20 @@ function setupInput() {
   process.stdin.setEncoding('utf-8');
   process.stdin.on('data', async data => {
     if (state.loading) return;
+    resetCursorBlink();
     const hadMouse = await handleMouseData(data);
     if (hadMouse) return;
     await handleKey(data);
   });
+}
+
+function resetCursorBlink() {
+  state.cursorBlinkOn = true;
+  if (blinkTimer) clearInterval(blinkTimer);
+  blinkTimer = setInterval(() => {
+    state.cursorBlinkOn = !state.cursorBlinkOn;
+    render();
+  }, 530);
 }
 
 function setupWatcher() {
@@ -146,6 +157,10 @@ function setupWatcher() {
 }
 
 function shutdown() {
+  if (blinkTimer) {
+    clearInterval(blinkTimer);
+    blinkTimer = null;
+  }
   if (watcherTimer) {
     clearInterval(watcherTimer);
     watcherTimer = null;
@@ -167,6 +182,7 @@ async function main() {
   render();
   await loadInitialWorkspace();
   render();
+  resetCursorBlink();
   setupWatcher();
 
   process.on('SIGTERM', () => { shutdown(); process.exit(0); });
