@@ -107,6 +107,7 @@ async function readDirectory(dirPath) {
     isSymlink: !!entry.is_symlink,
     size: entry.size_bytes || 0,
     mtime: entry.mtime_ms || 0,
+    ctime: entry.birthtime_ms || entry.created_ms || entry.creation_time_ms || entry.ctime_ms || 0,
   }));
   items.sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;

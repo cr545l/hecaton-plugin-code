@@ -129,28 +129,20 @@ function renderMinimized() {
 }
 
 function renderTitle(width) {
-  const rootName = baseName(state.root) || state.root || 'No Folder';
-  const focus = state.focus === 'tree' ? 'Explorer' : 'Editor';
-  const dirty = state.dirty ? colors.dirty + ' unsaved' + ansi.reset : '';
   const zones = [];
   let col = 1;
-  let line = colors.title + ansi.bold + ' Code' + ansi.reset;
-  col += 5;
+  let line = '';
 
   const explorerLabel = state.treeCollapsed ? ' [+ Explorer] ' : ' [- Explorer] ';
-  zones.push({ row: 1, colStart: col + 1, colEnd: col + explorerLabel.length, action: 'toggle-tree' });
-  line += colors.dim + ' ' + ansi.reset + colors.title + explorerLabel + ansi.reset;
-  col += 1 + explorerLabel.length;
+  zones.push({ row: 1, colStart: col, colEnd: col + explorerLabel.length - 1, action: 'toggle-tree' });
+  line += colors.title + explorerLabel + ansi.reset;
+  col += explorerLabel.length;
 
   const editorLabel = state.editorCollapsed ? ' [+ Editor] ' : ' [- Editor] ';
   zones.push({ row: 1, colStart: col, colEnd: col + editorLabel.length - 1, action: 'toggle-editor' });
   line += colors.title + editorLabel + ansi.reset;
-  col += editorLabel.length;
 
   state.layout.titleZones = zones;
-  line += colors.dim + ' ' + rootName + ansi.reset +
-    colors.dim + '  focus: ' + ansi.reset + focus +
-    dirty;
   return fit(line, width);
 }
 
@@ -165,7 +157,7 @@ function renderPanelHeaders(layout) {
     ? (state.dirty ? '* ' : '') + state.openName + (state.readonly ? ' [readonly]' : '') + '  Lines ' + state.editLines.length
     : 'No file';
   let line = '';
-  if (layout.hasTree) line += leftStyle + fit(' EXPLORER  ' + rootLabel + treeCount, treeW) + ansi.reset;
+  if (layout.hasTree) line += leftStyle + fit(' ' + rootLabel + treeCount, treeW) + ansi.reset;
   if (layout.dividerVisible) line += colors.border + '\u2502' + ansi.reset;
   if (layout.hasEditor) line += rightStyle + fit(' ' + fileLabel, editorW) + ansi.reset;
   return line;
@@ -387,19 +379,40 @@ function isSelected(row, col, sel) {
 }
 
 function renderStatus(width) {
-  const fileInfo = state.openPath
-    ? ' Ln ' + (state.cursorRow + 1) + '/' + state.editLines.length + ', Col ' + (state.cursorCol + 1) +
-      (state.fileSizeBytes ? '  ' + formatSize(state.fileSizeBytes) : '') +
-      (state.fileMtimeMs ? '  ' + formatTime(state.fileMtimeMs) : '') +
-      (getLanguage(state.openPath) ? '  ' + getLanguage(state.openPath) : '')
-    : '';
+  const info = state.focus === 'editor' && state.openPath
+    ? renderEditorStatusInfo()
+    : renderExplorerStatusInfo();
   const messageColor = state.statusKind === 'error' ? colors.error :
     state.statusKind === 'success' ? colors.saved : colors.status;
-  const message = state.status ? messageColor + ' ' + state.status + ansi.reset : '';
-  const hints = state.focus === 'tree'
-    ? ' Enter open  Left/Right expand  Ctrl+B toggle Explorer  drag divider'
-    : ' Ctrl+S save  Ctrl+W close  Ctrl+B toggle Explorer  drag divider';
-  return fit(colors.status + hints + ansi.reset + message + colors.status + fileInfo + ansi.reset, width);
+  const message = state.status ? '  ' + messageColor + state.status + ansi.reset : '';
+  return fit(colors.status + ' ' + info + ansi.reset + message, width);
+}
+
+function renderEditorStatusInfo() {
+  const parts = [
+    (state.dirty ? '* ' : '') + (state.openName || baseName(state.openPath)),
+    'Ln ' + (state.cursorRow + 1) + '/' + state.editLines.length,
+    'Col ' + (state.cursorCol + 1),
+  ];
+  if (state.readonly) parts.push('readonly');
+  if (state.binary) parts.push('binary');
+  if (state.fileSizeBytes) parts.push(formatSize(state.fileSizeBytes));
+  const lang = getLanguage(state.openPath);
+  if (lang) parts.push(lang);
+  return parts.filter(Boolean).join('  ');
+}
+
+function renderExplorerStatusInfo() {
+  const entry = state.treeEntries[state.treeCursor];
+  if (!state.root) return 'No folder selected';
+  if (!entry) return 'Folder  ' + state.root;
+
+  const parts = [entry.name];
+  if (entry.isSymlink) parts.push('symlink');
+  if (!entry.isDir) parts.push(formatSize(entry.size || 0));
+  if (entry.mtime) parts.push('Modified ' + formatTime(entry.mtime));
+  if (entry.ctime) parts.push('Created ' + formatTime(entry.ctime));
+  return parts.filter(Boolean).join('  ');
 }
 
 function scrollPct(offset, maxScroll) {
