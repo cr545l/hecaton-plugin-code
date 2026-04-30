@@ -45,6 +45,12 @@ const theme = {
   tag: ansi.fg.brightBlue,
   attr: ansi.fg.cyan,
   section: ansi.bold + ansi.fg.brightMagenta,
+  selector: ansi.fg.brightYellow,
+  addition: ansi.fg.green,
+  deletion: ansi.fg.red,
+  strong: ansi.bold + ansi.fg.brightWhite,
+  emphasis: ansi.italic + ansi.fg.white,
+  link: ansi.underline + ansi.fg.cyan,
   default: '',
 };
 
@@ -154,6 +160,12 @@ function getAnsiForClass(className) {
   if (cls.includes('number')) return theme.number;
   if (cls.includes('regexp')) return theme.regexp;
   if (cls.includes('string')) return theme.string;
+  if (cls.includes('addition')) return theme.addition;
+  if (cls.includes('deletion')) return theme.deletion;
+  if (cls.includes('strong')) return theme.strong;
+  if (cls.includes('emphasis')) return theme.emphasis;
+  if (cls.includes('link')) return theme.link;
+  if (cls.includes('selector')) return theme.selector;
   if (cls.includes('title') && (cls.includes('class') || cls.includes('class_'))) return theme.class_;
   if (cls.includes('title') || cls.includes('function')) return theme.function;
   if (cls.includes('variable') || cls.includes('params') || cls.includes('subst')) return theme.variable;

@@ -3,6 +3,7 @@ const { state, setStatus } = require('./state');
 const {
   trimTrailingSlash,
   joinPath,
+  baseName,
   dirName,
   resolvePath,
   refreshTree,
@@ -32,7 +33,7 @@ const {
   closeFile,
 } = require('./editor');
 const { render } = require('./render');
-const { screenColToCharIdx, wordBoundsAt } = require('./text');
+const { screenColToCharIdx, stringWidth, wordBoundsAt } = require('./text');
 
 let currentMouseShape = 'default';
 let cursorApiWarningShown = false;
@@ -168,7 +169,7 @@ async function changeFolder(folderPath, force) {
   await closeFile(true);
   setRoot(folderPath);
   await refreshTree();
-  hecaton.window.set_title({ title: 'Code - ' + (folderPath.split('/').filter(Boolean).pop() || folderPath) }).catch(() => null);
+  hecaton.window.set_title({ title: baseName(folderPath) || folderPath }).catch(() => null);
   render();
 }
 
@@ -221,7 +222,7 @@ function toggleTreePanel() {
   if (state.treeCollapsed && state.editorCollapsed) state.editorCollapsed = false;
   if (state.treeCollapsed && state.focus === 'tree') state.focus = 'editor';
   if (!state.treeCollapsed && !state.openPath) state.focus = 'tree';
-  setStatus(state.treeCollapsed ? 'Explorer hidden' : 'Explorer shown', 'info', 1600);
+  setStatus(state.treeCollapsed ? 'Files hidden' : 'Files shown', 'info', 1600);
   render();
 }
 
@@ -373,7 +374,7 @@ async function handleMouseData(data) {
     state.mouseDown = false;
     state.dragging = null;
     state.panDragStart = null;
-    if (wasDragging === 'editor-scrollbar' || wasDragging === 'pan') {
+    if (wasDragging === 'editor-scrollbar' || wasDragging === 'editor-hscrollbar' || wasDragging === 'pan') {
       state.scrollFreed = true;
       render();
     }
@@ -385,7 +386,7 @@ async function handleMouseData(data) {
     const deltaY = cy - state.panDragStart.y;
     const deltaX = cx - state.panDragStart.x;
     state.scrollY = Math.max(0, Math.min(getMaxEditorScroll(), state.panDragStart.scrollY - deltaY));
-    state.scrollX = Math.max(0, state.panDragStart.scrollX - deltaX);
+    state.scrollX = Math.max(0, Math.min(getMaxEditorScrollX(), state.panDragStart.scrollX - deltaX));
     render();
     return true;
   }
@@ -403,7 +404,28 @@ async function handleMouseData(data) {
   }
 
   if (wheel && pressed) {
-    const delta = btn === 0 ? -3 : 3;
+    const wheelStep = (cb & 1) !== 0 ? 3 : -3;
+    const wheelBtn = cb & 3;
+    const isHorizontalWheel = wheelBtn === 2 || wheelBtn === 3;
+    const isShiftWheel = (cb & 4) !== 0;
+    const inBody = cy >= state.layout.bodyTop && cy < state.layout.bodyTop + state.layout.bodyH;
+    const inEditorCols = !state.editorCollapsed &&
+      cx >= state.layout.editorCol &&
+      cx <= state.layout.editorScrollCol;
+    const inEditorWheelArea = inEditorCols && (inBody || cy === state.layout.bottomSepRow);
+
+    if ((isHorizontalWheel || isShiftWheel) && state.openPath && inEditorWheelArea) {
+      state.focus = 'editor';
+      state.scrollFreed = true;
+      const prev = state.scrollX;
+      state.scrollX = Math.max(0, Math.min(getMaxEditorScrollX(), state.scrollX + wheelStep));
+      if (state.scrollX !== prev) render();
+      return true;
+    }
+
+    if (isHorizontalWheel) return true;
+
+    const delta = wheelStep;
     if (!state.treeCollapsed && cx <= state.layout.treeW) {
       state.focus = 'tree';
       state.treeCursor = Math.max(0, Math.min(Math.max(0, state.treeEntries.length - 1), state.treeCursor + delta));
@@ -420,7 +442,7 @@ async function handleMouseData(data) {
 
   if (motion && state.dragging) {
     if (state.dragging === 'divider') setDividerFromMouse(cx);
-    else setScrollFromMouse(state.dragging, cy);
+    else setScrollFromMouse(state.dragging, cx, cy);
     render();
     return true;
   }
@@ -449,16 +471,24 @@ async function handleMouseData(data) {
       return true;
     }
 
+    if (isEditorHScrollCell(cx, cy)) {
+      state.focus = 'editor';
+      state.dragging = 'editor-hscrollbar';
+      setScrollFromMouse(state.dragging, cx, cy);
+      render();
+      return true;
+    }
+
     if (cy >= state.layout.bodyTop && cy < state.layout.bodyTop + state.layout.bodyH) {
       if (cx === state.layout.treeScrollCol) {
         state.focus = 'tree';
         state.dragging = 'tree-scrollbar';
-        setScrollFromMouse(state.dragging, cy);
+        setScrollFromMouse(state.dragging, cx, cy);
         render();
       } else if (cx === state.layout.editorScrollCol) {
         state.focus = 'editor';
         state.dragging = 'editor-scrollbar';
-        setScrollFromMouse(state.dragging, cy);
+        setScrollFromMouse(state.dragging, cx, cy);
         render();
       } else if (cx <= state.layout.treeW) {
         await clickTree(cy);
@@ -489,6 +519,7 @@ function updateCursorForCell(col, row) {
 function cursorForCell(col, row) {
   if (state.dragging === 'divider') return 'ew-resize';
   if (state.dragging === 'tree-scrollbar' || state.dragging === 'editor-scrollbar') return 'ns-resize';
+  if (state.dragging === 'editor-hscrollbar') return 'ew-resize';
 
   if (row === 1 && findTitleZone(col)) return 'pointer';
 
@@ -507,6 +538,7 @@ function cursorForCell(col, row) {
     }
   }
 
+  if (isEditorHScrollCell(col, row)) return 'ew-resize';
   if (row === 2) return 'pointer';
   return 'default';
 }
@@ -535,6 +567,17 @@ function getMaxEditorScroll() {
   return Math.max(0, state.editLines.length - state.layout.bodyH);
 }
 
+function getEditorContentWidth() {
+  return Math.max(1, state.layout.editorW - state.layout.gutterW - 3);
+}
+
+function getMaxEditorScrollX() {
+  const contentW = getEditorContentWidth();
+  let maxLineW = 0;
+  for (const line of state.editLines) maxLineW = Math.max(maxLineW, stringWidth(line));
+  return Math.max(0, maxLineW - contentW);
+}
+
 function isEditorCell(cx, cy) {
   return !state.editorCollapsed &&
     cy >= state.layout.bodyTop &&
@@ -543,7 +586,17 @@ function isEditorCell(cx, cy) {
     cx < state.layout.editorScrollCol;
 }
 
-function setScrollFromMouse(target, cy) {
+function isEditorHScrollCell(cx, cy) {
+  const trackCols = getEditorHScrollbarTrackCols();
+  return !state.editorCollapsed &&
+    state.openPath &&
+    getMaxEditorScrollX() > 0 &&
+    cy === state.layout.bottomSepRow &&
+    cx >= state.layout.editorCol &&
+    cx < state.layout.editorCol + trackCols;
+}
+
+function setScrollFromMouse(target, cx, cy) {
   const row = Math.max(0, Math.min(state.layout.bodyH - 1, cy - state.layout.bodyTop));
   const denom = Math.max(1, state.layout.bodyH - 1);
   if (target === 'tree-scrollbar') {
@@ -559,6 +612,19 @@ function setScrollFromMouse(target, cy) {
     state.scrollY = Math.round((row / denom) * maxScroll);
     state.scrollFreed = true;
   }
+  if (target === 'editor-hscrollbar') {
+    const maxScrollX = getMaxEditorScrollX();
+    if (maxScrollX <= 0) return;
+    const width = getEditorHScrollbarTrackCols();
+    const col = Math.max(0, Math.min(width - 1, cx - state.layout.editorCol));
+    const denomX = Math.max(1, width - 1);
+    state.scrollX = Math.max(0, Math.min(maxScrollX, Math.round((col / denomX) * maxScrollX)));
+    state.scrollFreed = true;
+  }
+}
+
+function getEditorHScrollbarTrackCols() {
+  return Math.max(1, state.layout.editorW - (getMaxEditorScroll() > 0 ? 1 : 0));
 }
 
 async function clickTree(cy) {
@@ -758,7 +824,7 @@ function getTreeMenuItems() {
     { id: 'new_file', label: 'New File...', icon: 'new-file' },
     { id: 'new_folder', label: 'New Folder...', icon: 'new-folder' },
     { type: 'separator' },
-    { id: 'toggle_tree_panel', label: state.treeCollapsed ? 'Show Explorer' : 'Hide Explorer', icon: 'layout-sidebar-left' },
+    { id: 'toggle_tree_panel', label: state.treeCollapsed ? 'Show Files' : 'Hide Files', icon: 'layout-sidebar-left' },
     { id: 'toggle_editor_panel', label: state.editorCollapsed ? 'Show Editor' : 'Hide Editor', icon: 'layout' },
     { type: 'separator' },
     { id: 'open_folder', label: 'Open Folder...', icon: 'folder-opened' },
@@ -775,7 +841,7 @@ function getEditorMenuItems() {
     { id: 'save', label: 'Save', shortcut: 'Ctrl+S', icon: 'save', enabled: hasOpen && state.dirty && !state.readonly },
     { id: 'close_file', label: 'Close File', shortcut: 'Ctrl+W', icon: 'close', enabled: hasOpen },
     { type: 'separator' },
-    { id: 'toggle_tree_panel', label: state.treeCollapsed ? 'Show Explorer' : 'Hide Explorer', shortcut: 'Ctrl+B', icon: 'layout-sidebar-left' },
+    { id: 'toggle_tree_panel', label: state.treeCollapsed ? 'Show Files' : 'Hide Files', shortcut: 'Ctrl+B', icon: 'layout-sidebar-left' },
     { id: 'toggle_editor_panel', label: state.editorCollapsed ? 'Show Editor' : 'Hide Editor', icon: 'layout' },
     { type: 'separator' },
     { id: 'cut', label: 'Cut', shortcut: 'Ctrl+X', icon: 'cut', enabled: hasSel && !state.readonly },
@@ -918,7 +984,7 @@ async function handleDialogResult(params) {
     } else {
       await refreshTree(target);
       if (pending.type === 'new-file') await openFile(target, { force: true });
-      setStatus('Created ' + target, 'success', 2500);
+      setStatus('Created ' + (baseName(target) || target), 'success', 2500);
     }
     render();
   }

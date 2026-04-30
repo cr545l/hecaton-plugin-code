@@ -1,4 +1,6 @@
 const CURSOR_PALETTE = [[220, 225, 235]];
+const SCROLLBAR_PALETTE = [[100, 110, 130]];
+const SCROLLBAR_ACTIVE_PALETTE = [[210, 225, 245]];
 
 function renderCursorPixels(cW, cH) {
   const buf = new Uint8Array(cW * cH);
@@ -6,6 +8,53 @@ function renderCursorPixels(cW, cH) {
   for (let y = 0; y < cH; y++) {
     for (let x = 0; x < thickness && x < cW; x++) {
       buf[y * cW + x] = 1;
+    }
+  }
+  return buf;
+}
+
+function renderScrollbarPixels(cW, cH, viewportRows, offset, maxScroll) {
+  if (maxScroll <= 0) return null;
+  const w = cW;
+  const trackH = viewportRows * cH;
+  if (w <= 0 || trackH <= 0) return null;
+  const totalItems = viewportRows + maxScroll;
+  const handleH = Math.max(cH, Math.floor(trackH * viewportRows / totalItems));
+  const handleY = Math.floor((trackH - handleH) * offset / maxScroll);
+  const buf = new Uint8Array(w * trackH);
+  const padX = 2;
+  const roundY = 1;
+  for (let y = handleY; y < handleY + handleH && y < trackH; y++) {
+    const dy = y - handleY;
+    const dyEnd = handleY + handleH - 1 - y;
+    for (let x = padX; x < w - padX; x++) {
+      if (dy < roundY && (x === padX || x === w - padX - 1)) continue;
+      if (dyEnd < roundY && (x === padX || x === w - padX - 1)) continue;
+      buf[y * w + x] = 1;
+    }
+  }
+  return buf;
+}
+
+function renderHScrollbarPixels(cW, cH, trackCols, viewportCols, offset, maxScrollX) {
+  if (maxScrollX <= 0) return null;
+  const w = trackCols * cW;
+  const h = cH;
+  if (w <= 0 || h <= 0) return null;
+  const totalContent = viewportCols + maxScrollX;
+  const handleW = Math.max(cW, Math.floor(w * viewportCols / totalContent));
+  const handleX = Math.floor((w - handleW) * offset / maxScrollX);
+  const buf = new Uint8Array(w * h);
+  const barThickness = Math.max(1, cW - 4);
+  const padY = Math.max(0, Math.floor((h - barThickness) / 2));
+  const roundX = 1;
+  for (let x = handleX; x < handleX + handleW && x < w; x++) {
+    const dx = x - handleX;
+    const dxEnd = handleX + handleW - 1 - x;
+    for (let y = padY; y < h - padY; y++) {
+      if (dx < roundX && (y === padY || y === h - padY - 1)) continue;
+      if (dxEnd < roundX && (y === padY || y === h - padY - 1)) continue;
+      buf[y * w + x] = 1;
     }
   }
   return buf;
@@ -74,7 +123,11 @@ function encodeSixel(buf, w, h, palette) {
 
 module.exports = {
   CURSOR_PALETTE,
+  SCROLLBAR_PALETTE,
+  SCROLLBAR_ACTIVE_PALETTE,
   renderCursorPixels,
+  renderScrollbarPixels,
+  renderHScrollbarPixels,
   encodeSixel,
   encodeClearSixel,
 };

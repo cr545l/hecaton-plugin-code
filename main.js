@@ -69,8 +69,7 @@ async function loadInitialWorkspace() {
     await openFile(initialFile, { force: true, keepFocus: false });
   }
 
-  hecaton.window.set_title({ title: 'Code - ' + (baseName(state.root) || state.root) }).catch(() => null);
-  setStatus('Folder: ' + state.root, 'info', 2200);
+  hecaton.window.set_title({ title: baseName(state.root) || state.root }).catch(() => null);
 }
 
 function setupEvents() {

@@ -206,7 +206,7 @@ function setRoot(rootPath) {
   state.treeEntries = [];
   state.treeCursor = 0;
   state.treeScroll = 0;
-  setStatus('Folder: ' + state.root, 'info', 2500);
+  setStatus('Folder changed', 'info', 1600);
 }
 
 module.exports = {
