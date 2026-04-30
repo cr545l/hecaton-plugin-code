@@ -1,0 +1,20 @@
+{
+  "id": "code",
+  "name": "Code",
+  "icon": "code",
+  "version": "0.1.0",
+  "entry": "main.js",
+  "apiVersion": "1.0",
+  "overlay": {
+    "mode": "floating",
+    "width": "78%",
+    "height": "78%",
+    "z_order": 50,
+    "minimizable": true,
+    "maximizable": true,
+    "resizable": true,
+    "bordered": true,
+    "minimized_label": "Code",
+    "minimized_label_color": "#61AFEF"
+  }
+}
