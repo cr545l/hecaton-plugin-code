@@ -7,7 +7,7 @@ const state = {
   loading: true,
 
   root: '',
-  showHidden: false,
+  showHidden: true,
   expandedDirs: new Set(),
   treeEntries: [],
   treeCursor: 0,
