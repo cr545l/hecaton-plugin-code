@@ -20,6 +20,7 @@ const state = {
   openPath: '',
   openName: '',
   originalContent: '',
+  lineEnding: '\n',
   editLines: [''],
   cursorRow: 0,
   cursorCol: 0,
@@ -58,6 +59,9 @@ const state = {
   maxUndo: 200,
   lastUndoType: '',
   lastUndoTime: 0,
+
+  findQuery: '',
+  findCaseSensitive: false,
 
   pendingDialog: null,
   pendingOpenPath: '',

@@ -8,7 +8,7 @@ const {
   visibleSlice,
   sanitizeDisplayText,
 } = require('./text');
-const { getSelectionRange, hasSelection } = require('./editor');
+const { getSelectionRange, hasSelection, countFindMatches } = require('./editor');
 const { highlightLine, getLanguage } = require('./highlighter');
 const {
   CURSOR_PALETTE,
@@ -32,7 +32,7 @@ function fit(text, width) {
 }
 
 function resetInlineStyle() {
-  return ansi.noBold + ansi.noItalic + ansi.noUnderline + ansi.noInverse + ansi.fg.default;
+  return ansi.noBold + ansi.noItalic + ansi.noUnderline + ansi.noInverse + ansi.fg.default + ansi.bg.default;
 }
 
 function render() {
@@ -332,11 +332,13 @@ function renderCodeContent(lineIdx, width) {
   const segment = slice.text;
   const leading = ' '.repeat(slice.leftPad);
   const selected = selectionTouchesLine(lineIdx);
+  const findRanges = state.findQuery ? findRangesForLine(lineIdx) : [];
+  const found = findRanges.length > 0;
   const highlightedLine = highlightLine(displayLine, state.openPath);
   const highlighted = sliceAnsiPlainRange(highlightedLine, slice.start, slice.start + segment.length);
 
-  if (selected) {
-    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start), width);
+  if (selected || found) {
+    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start, findRanges), width);
   }
 
   return fit(leading + highlighted, width);
@@ -374,7 +376,26 @@ function selectionTouchesLine(lineIdx) {
   return lineIdx >= r.startRow && lineIdx <= r.endRow;
 }
 
-function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar) {
+function findRangesForLine(lineIdx) {
+  const query = state.findQuery || '';
+  if (!query) return [];
+  const raw = state.editLines[lineIdx] || '';
+  const line = state.findCaseSensitive ? raw : raw.toLowerCase();
+  const needle = state.findCaseSensitive ? query : query.toLowerCase();
+  const ranges = [];
+  let idx = 0;
+  while ((idx = line.indexOf(needle, idx)) >= 0) {
+    ranges.push({ start: idx, end: idx + query.length });
+    idx += Math.max(1, query.length);
+  }
+  return ranges;
+}
+
+function isFindMatch(col, ranges) {
+  return ranges.some(r => col >= r.start && col < r.end);
+}
+
+function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar, findRanges) {
   const sel = getSelectionRange();
   let out = '';
   let plainOffset = 0;
@@ -394,7 +415,9 @@ function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar) {
     const ch = String.fromCodePoint(cp);
     const absolute = startChar + plainOffset;
     const selected = sel && isSelected(lineIdx, absolute, sel);
+    const found = !selected && isFindMatch(absolute, findRanges || []);
     if (selected) out += ansi.inverse + ch + ansi.noInverse;
+    else if (found) out += ansi.underline + ch + ansi.noUnderline;
     else out += ch;
     i += ch.length;
     plainOffset += ch.length;
@@ -454,12 +477,22 @@ function renderEditorStatusInfo() {
     'Ln ' + (state.cursorRow + 1) + '/' + state.editLines.length,
     'Col ' + (state.cursorCol + 1),
   ];
+  if (hasSelection()) parts.push(selectionSummary());
+  if (state.undoStack.length || state.redoStack.length) parts.push('U ' + state.undoStack.length + ' R ' + state.redoStack.length);
+  if (state.findQuery) parts.push('Find ' + countFindMatches(state.findQuery));
   if (state.readonly) parts.push('readonly');
   if (state.binary) parts.push('binary');
   if (state.fileSizeBytes) parts.push(formatSize(state.fileSizeBytes));
   const lang = getLanguage(state.openPath);
   if (lang) parts.push(lang);
   return parts.filter(Boolean).join('  ');
+}
+
+function selectionSummary() {
+  const r = getSelectionRange();
+  if (!r) return '';
+  if (r.startRow === r.endRow) return 'Sel ' + Math.max(0, r.endCol - r.startCol);
+  return 'Sel ' + (r.endRow - r.startRow + 1) + ' lines';
 }
 
 function renderExplorerStatusInfo() {

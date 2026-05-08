@@ -17,15 +17,34 @@ const {
   insertText,
   deleteBackward,
   deleteForward,
+  deleteWordBackward,
+  deleteWordForward,
+  deleteToLineStart,
+  deleteToLineEnd,
+  deleteLine,
+  indentLines,
+  outdentLines,
+  duplicateLines,
+  moveLines,
+  toggleLineComment,
   moveCursor,
   moveVertical,
   moveHorizontal,
   moveWord,
+  moveHome,
+  moveDocumentStart,
+  moveDocumentEnd,
   selectAll,
   selectedText,
-  deleteSelectionOnly,
-  snapshot,
-  markDirty,
+  currentLineText,
+  deleteSelection,
+  tryInsertPair,
+  trySkipClosingPair,
+  tryDeletePairBackward,
+  findNext,
+  gotoLine,
+  canUndo,
+  canRedo,
   undo,
   redo,
   openFile,
@@ -207,13 +226,13 @@ async function pasteFromClipboard() {
 }
 
 function copySelection(cut) {
-  const text = selectedText();
+  let text = selectedText();
+  if (!text && state.openPath) text = currentLineText();
   if (!text) return;
   hecaton.clipboard.write({ text }).catch(() => null);
   if (cut && !state.readonly) {
-    snapshot('delete');
-    deleteSelectionOnly();
-    markDirty();
+    if (selectedText()) deleteSelection('cut');
+    else deleteLine();
   }
 }
 
@@ -285,25 +304,28 @@ async function handleEditorKey(key) {
     toggleTreePanel();
     return;
   }
-  if (key === CSI + 'Z') {
-    if (!state.treeCollapsed) state.focus = 'tree';
-    render();
-    return;
-  }
   if (key === '\x13') { await saveFile(); render(); return; }
   if (key === '\x17') { await closeFile(false); render(); return; }
   if (key === '\x0f') { await chooseFolder(); return; }
+  if (key === '\x06') { await promptFind(); return; }
+  if (key === '\x07') { await promptGotoLine(); return; }
   if (key === '\x01') { selectAll(); render(); return; }
   if (key === '\x03') { copySelection(false); render(); return; }
   if (key === '\x18') { copySelection(true); render(); return; }
   if (key === '\x16') { await pasteFromClipboard(); return; }
   if (key === '\x1a') { undo(); render(); return; }
   if (key === '\x19') { redo(); render(); return; }
+  if (key === '\x15') { deleteToLineStart(); render(); return; }
+  if (key === '\x0b') { deleteToLineEnd(); render(); return; }
+  if (key === '\x1f') { toggleLineComment(); render(); return; }
 
   if (key === CSI + 'A') { moveVertical(-1, false); render(); return; }
   if (key === CSI + 'B') { moveVertical(1, false); render(); return; }
   if (key === CSI + 'C') { moveHorizontal(1, false); render(); return; }
   if (key === CSI + 'D') { moveHorizontal(-1, false); render(); return; }
+  if (key === CSI + '1;3A') { moveLines(-1); render(); return; }
+  if (key === CSI + '1;3B') { moveLines(1); render(); return; }
+  if (key === CSI + '1;4A' || key === CSI + '1;4B') { duplicateLines(); render(); return; }
   if (key === CSI + '1;2A') { moveVertical(-1, true); render(); return; }
   if (key === CSI + '1;2B') { moveVertical(1, true); render(); return; }
   if (key === CSI + '1;2C') { moveHorizontal(1, true); render(); return; }
@@ -312,16 +334,40 @@ async function handleEditorKey(key) {
   if (key === CSI + '1;5D') { moveWord(-1, false); render(); return; }
   if (key === CSI + '1;6C') { moveWord(1, true); render(); return; }
   if (key === CSI + '1;6D') { moveWord(-1, true); render(); return; }
-  if (key === CSI + 'H' || key === CSI + '1~') { moveCursor(state.cursorRow, 0, false); render(); return; }
+  if (key === CSI + 'H' || key === CSI + '1~') { moveHome(false); render(); return; }
   if (key === CSI + 'F' || key === CSI + '4~') { moveCursor(state.cursorRow, state.editLines[state.cursorRow].length, false); render(); return; }
-  if (key === CSI + '1;2H') { moveCursor(state.cursorRow, 0, true); render(); return; }
+  if (key === CSI + '1;2H') { moveHome(true); render(); return; }
   if (key === CSI + '1;2F') { moveCursor(state.cursorRow, state.editLines[state.cursorRow].length, true); render(); return; }
+  if (key === CSI + '1;5H' || key === CSI + '1;5~') { moveDocumentStart(false); render(); return; }
+  if (key === CSI + '1;5F' || key === CSI + '4;5~') { moveDocumentEnd(false); render(); return; }
+  if (key === CSI + '1;6H') { moveDocumentStart(true); render(); return; }
+  if (key === CSI + '1;6F') { moveDocumentEnd(true); render(); return; }
   if (key === CSI + '5~') { moveVertical(-Math.max(1, state.layout.bodyH), false); render(); return; }
   if (key === CSI + '6~') { moveVertical(Math.max(1, state.layout.bodyH), false); render(); return; }
+  if (key === CSI + '13~') { findNext(null, false); render(); return; }
+  if (key === CSI + '25~' || key === CSI + '1;2R') { findNext(null, true); render(); return; }
+  if (key === CSI + '3;5~') { deleteWordForward(); render(); return; }
+  if (key === CSI + '127;5u' || key === CSI + '8;5u' || key === ESC + '\x7f') { deleteWordBackward(); render(); return; }
+  if (key === CSI + '75;5u' || key === CSI + '75;6u') { deleteLine(); render(); return; }
   if (key === CSI + '3~') { deleteForward(); render(); return; }
-  if (key === '\x7f' || key === '\b') { deleteBackward(); render(); return; }
+  if (key === '\x7f' || key === '\b') {
+    if (!tryDeletePairBackward()) deleteBackward();
+    render();
+    return;
+  }
   if (key === '\r' || key === '\n') { insertText('\n', 'newline'); render(); return; }
-  if (key === '\t') { insertText('  ', 'insert'); render(); return; }
+  if (key === CSI + 'Z') {
+    if (state.openPath) outdentLines();
+    else if (!state.treeCollapsed) state.focus = 'tree';
+    render();
+    return;
+  }
+  if (key === '\t') {
+    if (state.selAnchorRow >= 0) indentLines();
+    else insertText('  ', 'insert');
+    render();
+    return;
+  }
 
   if (key.length > 1 && key[0] !== ESC) {
     const text = key.replace(/\r/g, '\n');
@@ -333,6 +379,10 @@ async function handleEditorKey(key) {
   }
 
   if (isPlainText(key)) {
+    if (key.length === 1 && (trySkipClosingPair(key) || tryInsertPair(key))) {
+      render();
+      return;
+    }
     insertText(key, 'insert');
     render();
   }
@@ -838,6 +888,9 @@ function getEditorMenuItems() {
   const hasOpen = !!state.openPath;
   const hasSel = !!selectedText();
   return [
+    { id: 'undo', label: 'Undo', shortcut: 'Ctrl+Z', icon: 'undo', enabled: canUndo() },
+    { id: 'redo', label: 'Redo', shortcut: 'Ctrl+Y', icon: 'redo', enabled: canRedo() },
+    { type: 'separator' },
     { id: 'save', label: 'Save', shortcut: 'Ctrl+S', icon: 'save', enabled: hasOpen && state.dirty && !state.readonly },
     { id: 'close_file', label: 'Close File', shortcut: 'Ctrl+W', icon: 'close', enabled: hasOpen },
     { type: 'separator' },
@@ -849,6 +902,17 @@ function getEditorMenuItems() {
     { id: 'paste', label: 'Paste', shortcut: 'Ctrl+V', icon: 'paste', enabled: hasOpen && !state.readonly },
     { id: 'select_all', label: 'Select All', shortcut: 'Ctrl+A', icon: 'selection', enabled: hasOpen },
     { type: 'separator' },
+    { id: 'find', label: 'Find...', shortcut: 'Ctrl+F', icon: 'search', enabled: hasOpen },
+    { id: 'find_next', label: 'Find Next', shortcut: 'F3', icon: 'arrow-down', enabled: hasOpen && !!state.findQuery },
+    { id: 'find_previous', label: 'Find Previous', shortcut: 'Shift+F3', icon: 'arrow-up', enabled: hasOpen && !!state.findQuery },
+    { id: 'goto_line', label: 'Go to Line...', shortcut: 'Ctrl+G', icon: 'go-to-file', enabled: hasOpen },
+    { type: 'separator' },
+    { id: 'toggle_comment', label: 'Toggle Line Comment', shortcut: 'Ctrl+/', icon: 'comment', enabled: hasOpen && !state.readonly },
+    { id: 'delete_line', label: hasSel ? 'Delete Selected Lines' : 'Delete Line', icon: 'trash', enabled: hasOpen && !state.readonly },
+    { id: 'duplicate_line', label: hasSel ? 'Duplicate Selected Lines' : 'Duplicate Line', icon: 'copy', enabled: hasOpen && !state.readonly },
+    { id: 'move_line_up', label: 'Move Line Up', icon: 'arrow-up', enabled: hasOpen && !state.readonly },
+    { id: 'move_line_down', label: 'Move Line Down', icon: 'arrow-down', enabled: hasOpen && !state.readonly },
+    { type: 'separator' },
     { id: 'copy_file_path', label: 'Copy File Path', icon: 'copy', enabled: hasOpen },
   ];
 }
@@ -856,6 +920,14 @@ function getEditorMenuItems() {
 async function handleContextMenuAction(actionId) {
   const entry = selectedEntry();
   switch (actionId) {
+    case 'undo':
+      undo();
+      render();
+      return;
+    case 'redo':
+      redo();
+      render();
+      return;
     case 'open':
       await openSelectedEntry();
       return;
@@ -907,6 +979,40 @@ async function handleContextMenuAction(actionId) {
       return;
     case 'select_all':
       selectAll();
+      render();
+      return;
+    case 'find':
+      await promptFind();
+      return;
+    case 'find_next':
+      findNext(null, false);
+      render();
+      return;
+    case 'find_previous':
+      findNext(null, true);
+      render();
+      return;
+    case 'goto_line':
+      await promptGotoLine();
+      return;
+    case 'toggle_comment':
+      toggleLineComment();
+      render();
+      return;
+    case 'delete_line':
+      deleteLine();
+      render();
+      return;
+    case 'duplicate_line':
+      duplicateLines();
+      render();
+      return;
+    case 'move_line_up':
+      moveLines(-1);
+      render();
+      return;
+    case 'move_line_down':
+      moveLines(1);
       render();
       return;
     case 'copy_file_path':
@@ -972,6 +1078,21 @@ async function handleDialogResult(params) {
     return;
   }
 
+  if (pending.type === 'find') {
+    if (button === 'find') {
+      if (value) findNext(value, false);
+      else state.findQuery = '';
+    }
+    render();
+    return;
+  }
+
+  if (pending.type === 'goto-line') {
+    if (button === 'go' && value) gotoLine(parseInt(value, 10));
+    render();
+    return;
+  }
+
   if (pending.type === 'new-file' || pending.type === 'new-folder') {
     if (button !== 'create' || !value.trim()) {
       render();
@@ -988,6 +1109,36 @@ async function handleDialogResult(params) {
     }
     render();
   }
+}
+
+async function promptFind() {
+  const selected = selectedText();
+  const seed = selected && selected.indexOf('\n') < 0 ? selected : state.findQuery;
+  state.pendingDialog = { type: 'find' };
+  await hecaton.dialog.show({
+    type: 'input',
+    title: 'Find',
+    message: 'Find:',
+    defaultValue: seed || '',
+    buttons: [
+      { id: 'find', label: 'Find', default: true },
+      { id: 'cancel', label: 'Cancel' },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
+}
+
+async function promptGotoLine() {
+  state.pendingDialog = { type: 'goto-line' };
+  await hecaton.dialog.show({
+    type: 'input',
+    title: 'Go to Line',
+    message: 'Line number:',
+    defaultValue: String(state.cursorRow + 1),
+    buttons: [
+      { id: 'go', label: 'Go', default: true },
+      { id: 'cancel', label: 'Cancel' },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
 }
 
 function cleanup() {
