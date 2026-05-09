@@ -417,7 +417,9 @@ async function handleMouseData(data) {
   const motion = !!(cb & 32);
   const wheel = !!(cb & 64);
 
+  const hoverChanged = updateHoverForCell(cx, cy);
   updateCursorForCell(cx, cy);
+  if (hoverChanged && motion && !wheel && !state.dragging && !state.mouseDown) render();
 
   if (!pressed && !wheel) {
     const wasDragging = state.dragging;
@@ -507,7 +509,7 @@ async function handleMouseData(data) {
     if (!motion) {
       const activityZone = findActivityZone(cx, cy);
       if (activityZone) {
-        await handleToolbarAction(activityZone.action);
+        if (activityZone.enabled !== false) await handleToolbarAction(activityZone.action);
         return true;
       }
     }
@@ -515,7 +517,7 @@ async function handleMouseData(data) {
     if (!motion && cy === 1) {
       const zone = findTitleZone(cx);
       if (zone) {
-        await handleToolbarAction(zone.action);
+        if (zone.enabled !== false) await handleToolbarAction(zone.action);
         return true;
       }
     }
@@ -566,7 +568,9 @@ function handleHostMouseEvent(params) {
   if (!params || state.minimized) return;
   const col = Number.isFinite(params.cell_x) ? Math.floor(params.cell_x) + 1 : 1;
   const row = Number.isFinite(params.cell_y) ? Math.floor(params.cell_y) + 1 : 1;
+  const hoverChanged = updateHoverForCell(col, row);
   updateCursorForCell(col, row);
+  if (hoverChanged) render();
 }
 
 function updateCursorForCell(col, row) {
@@ -578,8 +582,10 @@ function cursorForCell(col, row) {
   if (state.dragging === 'tree-scrollbar' || state.dragging === 'editor-scrollbar') return 'ns-resize';
   if (state.dragging === 'editor-hscrollbar') return 'ew-resize';
 
-  if (findActivityZone(col, row)) return 'pointer';
-  if (row === 1 && findTitleZone(col)) return 'pointer';
+  const activityZone = findActivityZone(col, row);
+  if (activityZone && activityZone.enabled !== false) return 'pointer';
+  const titleZone = row === 1 ? findTitleZone(col) : null;
+  if (titleZone && titleZone.enabled !== false) return 'pointer';
 
   if (state.layout.dividerVisible && col === state.layout.dividerCol &&
       row >= 2 && row <= state.layout.bottomSepRow) {
@@ -612,6 +618,23 @@ function findTitleZone(cx) {
 function findActivityZone(cx, cy) {
   const zones = state.layout.activityZones || [];
   return zones.find(z => cy === z.row && cx >= z.colStart && cx <= z.colEnd) || null;
+}
+
+function updateHoverForCell(cx, cy) {
+  const zone = findHoverZone(cx, cy);
+  const hoveredAction = zone ? (zone.action || '') : '';
+  const hoverStatus = zone ? (zone.label || '') : '';
+  if (state.hoveredAction === hoveredAction && state.hoverStatus === hoverStatus) return false;
+  state.hoveredAction = hoveredAction;
+  state.hoverStatus = hoverStatus;
+  return true;
+}
+
+function findHoverZone(cx, cy) {
+  const activityZone = findActivityZone(cx, cy);
+  if (activityZone) return activityZone;
+  if (cy === 1) return findTitleZone(cx);
+  return null;
 }
 
 async function handleToolbarAction(action) {

@@ -35,7 +35,7 @@ function resetInlineStyle() {
   return ansi.noBold + ansi.noItalic + ansi.noUnderline + ansi.noInverse + ansi.fg.default + ansi.bg.default;
 }
 
-const ACTIVITY_BAR_W = 4;
+const ACTIVITY_BAR_W = 8;
 const BOX = {
   H: '\u2500',
   V: '\u2502',
@@ -44,34 +44,6 @@ const BOX = {
   T_UP: '\u2534',
   T_RIGHT: '\u251c',
 };
-const CODICON_CODEPOINTS = {
-  'add': 0xea60,
-  'comment': 0xea6b,
-  'search': 0xea6d,
-  'close': 0xea76,
-  'file': 0xea7b,
-  'new-file': 0xea7f,
-  'folder-opened': 0xeaf7,
-  'files': 0xeaf0,
-  'go-to-file': 0xea94,
-  'discard': 0xeae2,
-  'edit': 0xea73,
-  'clippy': 0xeac0,
-  'refresh': 0xeb37,
-  'save': 0xeb4b,
-  'split-horizontal': 0xeb56,
-  'redo': 0xebb0,
-  'copy': 0xebcc,
-  'layout': 0xebeb,
-  'layout-sidebar-left': 0xebf3,
-  'remove': 0xeb3b,
-  'question': 0xeb32,
-};
-
-function codicon(name) {
-  return String.fromCodePoint(CODICON_CODEPOINTS[name] || CODICON_CODEPOINTS.question);
-}
-
 function render() {
   clearExpiredStatus();
   if (state.minimized) return renderMinimized();
@@ -183,31 +155,39 @@ function renderActivityRail(row, boundaryChar) {
   const width = state.layout.activityW || 0;
   if (width <= 0) return '';
 
-  const iconW = Math.max(1, width - 1);
-  let icon = ' ';
+  const labelW = Math.max(1, width - 1);
+  let text = ' ';
   let active = false;
   let focused = false;
   let action = '';
 
   if (row === 1) {
-    icon = codicon('files');
+    text = 'Files';
     active = !state.treeCollapsed;
     focused = state.focus === 'tree';
     action = 'toggle-tree';
   } else if (row === 2) {
-    icon = codicon('edit');
+    text = 'Editor';
     active = !state.editorCollapsed;
     focused = state.focus === 'editor';
     action = 'toggle-editor';
   }
 
   if (action) {
-    state.layout.activityZones.push({ row, colStart: 1, colEnd: iconW, action });
+    state.layout.activityZones.push({
+      row,
+      colStart: 1,
+      colEnd: labelW,
+      action,
+      enabled: true,
+      label: actionDescription(action),
+    });
   }
 
   let style = active ? colors.title : colors.dim;
+  if (action && state.hoveredAction === action) style = colors.active + (active ? colors.title : colors.dim);
   if (focused && active) style = colors.active + colors.title;
-  const cell = centerCell(icon, iconW);
+  const cell = centerCell(text, labelW);
   return style + cell + ansi.reset + colors.border + (boundaryChar || BOX.V) + ansi.reset;
 }
 
@@ -234,11 +214,16 @@ function renderTitle(width) {
       continue;
     }
 
-    const buttonW = 3;
+    const buttonW = toolbarButtonWidth(item);
     if (used + buttonW > width) break;
-    if (item.enabled) {
-      zones.push({ row: 1, colStart: col, colEnd: col + buttonW - 1, action: item.action });
-    }
+    zones.push({
+      row: 1,
+      colStart: col,
+      colEnd: col + buttonW - 1,
+      action: item.action,
+      enabled: item.enabled,
+      label: actionDescription(item.action),
+    });
     line += renderToolbarButton(item, buttonW);
     used += buttonW;
     col += buttonW;
@@ -253,31 +238,59 @@ function getToolbarItems() {
   const hasSel = hasSelection();
   const writable = hasOpen && !state.readonly;
   return [
-    { action: 'new_file', icon: 'new-file', enabled: !!state.root },
-    { action: 'open_folder', icon: 'folder-opened', enabled: true },
-    { action: 'refresh', icon: 'refresh', enabled: !!state.root },
+    { action: 'new_file', text: 'New', enabled: !!state.root },
+    { action: 'open_folder', text: 'Open', enabled: true },
+    { action: 'refresh', text: 'Ref', enabled: !!state.root },
     { type: 'separator' },
-    { action: 'save', icon: 'save', enabled: writable && state.dirty, accent: state.dirty ? 'dirty' : '' },
-    { action: 'close_file', icon: 'close', enabled: hasOpen },
+    { action: 'save', text: state.dirty ? 'Save*' : 'Save', enabled: writable && state.dirty, accent: state.dirty ? 'dirty' : '' },
+    { action: 'close_file', text: 'Close', enabled: hasOpen },
     { type: 'separator' },
-    { action: 'undo', icon: 'discard', enabled: canUndo() },
-    { action: 'redo', icon: 'redo', enabled: canRedo() },
+    { action: 'undo', text: 'Undo', enabled: canUndo() },
+    { action: 'redo', text: 'Redo', enabled: canRedo() },
     { type: 'separator' },
-    { action: 'cut', icon: 'remove', enabled: hasSel && !state.readonly },
-    { action: 'copy', icon: 'copy', enabled: hasSel },
-    { action: 'paste', icon: 'clippy', enabled: writable },
+    { action: 'cut', text: 'Cut', enabled: hasSel && !state.readonly },
+    { action: 'copy', text: 'Copy', enabled: hasSel },
+    { action: 'paste', text: 'Paste', enabled: writable },
     { type: 'separator' },
-    { action: 'find', icon: 'search', enabled: hasOpen },
-    { action: 'goto_line', icon: 'go-to-file', enabled: hasOpen },
-    { action: 'toggle_comment', icon: 'comment', enabled: writable },
+    { action: 'find', text: 'Find', enabled: hasOpen },
+    { action: 'goto_line', text: 'Line', enabled: hasOpen },
+    { action: 'toggle_comment', text: 'Cmt', enabled: writable },
   ];
 }
 
+function toolbarButtonWidth(item) {
+  return stringWidth(item.text || '') + 1;
+}
+
 function renderToolbarButton(item, width) {
-  const style = item.enabled
+  let style = item.enabled
     ? (item.accent === 'dirty' ? colors.dirty : colors.title)
     : colors.dim;
-  return style + centerCell(codicon(item.icon), width) + ansi.reset;
+  if (state.hoveredAction === item.action) {
+    style = colors.active + style;
+  }
+  return style + fit(' ' + (item.text || ''), width) + ansi.reset;
+}
+
+function actionDescription(action) {
+  const labels = {
+    'toggle-tree': state.treeCollapsed ? 'Show Files' : 'Hide Files',
+    'toggle-editor': state.editorCollapsed ? 'Show Editor' : 'Hide Editor',
+    new_file: 'New File',
+    open_folder: 'Open Folder',
+    refresh: 'Refresh Files',
+    save: 'Save File',
+    close_file: 'Close File',
+    undo: 'Undo',
+    redo: 'Redo',
+    cut: 'Cut Selection',
+    copy: 'Copy Selection',
+    paste: 'Paste',
+    find: 'Find',
+    goto_line: 'Go to Line',
+    toggle_comment: 'Toggle Comment',
+  };
+  return labels[action] || String(action || '');
 }
 
 function renderSeparator(layout) {
@@ -401,11 +414,12 @@ function renderTreeLines(width, height) {
     const nameColor = entry.isDir ? colors.treeDir : colors.treeFile;
     const inlineReset = resetInlineStyle();
     const openMark = open ? (selected ? '>' : colors.saved + '>' + inlineReset) : ' ';
-    let line = openMark + indent + marker + (selected ? entry.name : nameColor + entry.name + inlineReset);
+    const displayName = entry.name + (open && state.dirty ? '*' : '');
+    let line = openMark + indent + marker + (selected ? displayName : nameColor + displayName + inlineReset);
     if (!entry.isDir && contentW > 28) {
       const metaText = entry.size ? ' ' + formatSize(entry.size) : '';
       const meta = selected ? metaText : colors.dim + metaText + inlineReset;
-      const free = contentW - stringWidth(entry.name) - stringWidth(indent) - 5;
+      const free = contentW - stringWidth(displayName) - stringWidth(indent) - 5;
       if (free > 8) line += meta;
     }
     line = fit(line, contentW);
@@ -612,9 +626,12 @@ function renderStatus(width) {
   const info = state.focus === 'editor' && state.openPath
     ? renderEditorStatusInfo()
     : renderExplorerStatusInfo();
-  const messageColor = state.statusKind === 'error' ? colors.error :
-    state.statusKind === 'success' ? colors.saved : colors.status;
-  const message = state.status ? '  ' + messageColor + state.status + ansi.reset : '';
+  const hasStatus = !!state.status;
+  const messageText = hasStatus ? state.status : state.hoverStatus;
+  const messageColor = hasStatus
+    ? (state.statusKind === 'error' ? colors.error : state.statusKind === 'success' ? colors.saved : colors.status)
+    : colors.title;
+  const message = messageText ? '  ' + messageColor + messageText + ansi.reset : '';
   return fit(colors.status + ' ' + info + ansi.reset + message, width);
 }
 
