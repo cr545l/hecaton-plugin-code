@@ -214,11 +214,14 @@ function renderTitle(width) {
 
   for (const item of getToolbarItems()) {
     if (item.type === 'separator') {
-      if (used + 1 > width) break;
-      state.layout.titleDividerOffsets.push(used);
+      const separatorPad = used > 0 ? 1 : 0;
+      const separatorW = separatorPad + 1;
+      if (used + separatorW > width) break;
+      state.layout.titleDividerOffsets.push(used + separatorPad);
+      if (separatorPad) line += ' ';
       line += colors.border + BOX.V + ansi.reset;
-      used += 1;
-      col += 1;
+      used += separatorW;
+      col += separatorW;
       continue;
     }
 
@@ -267,7 +270,7 @@ function getToolbarItems() {
 }
 
 function toolbarButtonWidth(item) {
-  return stringWidth(item.text || '') + 1;
+  return stringWidth(item.text || '') + 2;
 }
 
 function renderToolbarButton(item, width) {
@@ -277,7 +280,7 @@ function renderToolbarButton(item, width) {
   if (state.hoveredAction === item.action) {
     style = colors.active + style;
   }
-  return style + fit(' ' + (item.text || ''), width) + ansi.reset;
+  return style + fit(' ' + (item.text || '') + ' ', width) + ansi.reset;
 }
 
 function actionDescription(action) {
