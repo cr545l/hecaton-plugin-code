@@ -32,9 +32,13 @@ const {
   moveHorizontal,
   moveWord,
   moveHome,
+  moveLineEnd,
   moveDocumentStart,
   moveDocumentEnd,
   selectAll,
+  addCursor,
+  addCursorVertical,
+  hasSelection,
   selectedText,
   currentLineText,
   deleteSelection,
@@ -53,6 +57,7 @@ const {
 } = require('./editor');
 const { render } = require('./render');
 const { screenColToCharIdx, stringWidth, wordBoundsAt } = require('./text');
+const { syncSelectionsFromLegacy } = require('./cursor-state');
 
 let currentMouseShape = 'default';
 let cursorApiWarningShown = false;
@@ -325,6 +330,8 @@ async function handleEditorKey(key) {
   if (key === CSI + 'D') { moveHorizontal(-1, false); render(); return; }
   if (key === CSI + '1;3A') { moveLines(-1); render(); return; }
   if (key === CSI + '1;3B') { moveLines(1); render(); return; }
+  if (key === CSI + '1;7A') { addCursorVertical(-1); render(); return; }
+  if (key === CSI + '1;7B') { addCursorVertical(1); render(); return; }
   if (key === CSI + '1;4A' || key === CSI + '1;4B') { duplicateLines(); render(); return; }
   if (key === CSI + '1;2A') { moveVertical(-1, true); render(); return; }
   if (key === CSI + '1;2B') { moveVertical(1, true); render(); return; }
@@ -335,9 +342,9 @@ async function handleEditorKey(key) {
   if (key === CSI + '1;6C') { moveWord(1, true); render(); return; }
   if (key === CSI + '1;6D') { moveWord(-1, true); render(); return; }
   if (key === CSI + 'H' || key === CSI + '1~') { moveHome(false); render(); return; }
-  if (key === CSI + 'F' || key === CSI + '4~') { moveCursor(state.cursorRow, state.editLines[state.cursorRow].length, false); render(); return; }
+  if (key === CSI + 'F' || key === CSI + '4~') { moveLineEnd(false); render(); return; }
   if (key === CSI + '1;2H') { moveHome(true); render(); return; }
-  if (key === CSI + '1;2F') { moveCursor(state.cursorRow, state.editLines[state.cursorRow].length, true); render(); return; }
+  if (key === CSI + '1;2F') { moveLineEnd(true); render(); return; }
   if (key === CSI + '1;5H' || key === CSI + '1;5~') { moveDocumentStart(false); render(); return; }
   if (key === CSI + '1;5F' || key === CSI + '4;5~') { moveDocumentEnd(false); render(); return; }
   if (key === CSI + '1;6H') { moveDocumentStart(true); render(); return; }
@@ -363,7 +370,7 @@ async function handleEditorKey(key) {
     return;
   }
   if (key === '\t') {
-    if (state.selAnchorRow >= 0) indentLines();
+    if (hasSelection()) indentLines();
     else insertText('  ', 'insert');
     render();
     return;
@@ -416,6 +423,7 @@ async function handleMouseData(data) {
   const btn = cb & 3;
   const motion = !!(cb & 32);
   const wheel = !!(cb & 64);
+  const addCursorModifier = !!(cb & 8) || !!(cb & 16);
 
   const hoverChanged = updateHoverForCell(cx, cy);
   updateCursorForCell(cx, cy);
@@ -552,7 +560,7 @@ async function handleMouseData(data) {
       } else if (isTreeCell(cx)) {
         await clickTree(cy);
       } else if (isEditorColumn(cx)) {
-        clickEditor(cx, cy);
+        clickEditor(cx, cy, addCursorModifier);
       }
     } else if (cy === 2) {
       state.focus = isTreeCell(cx) ? 'tree' : 'editor';
@@ -753,7 +761,7 @@ async function clickTree(cy) {
   else render();
 }
 
-function clickEditor(cx, cy) {
+function clickEditor(cx, cy, addCursorMode) {
   state.focus = 'editor';
   if (!state.openPath) {
     render();
@@ -762,6 +770,13 @@ function clickEditor(cx, cy) {
   state.scrollFreed = false;
   state.mouseDown = true;
   const pos = editorPositionFromMouse(cx, cy);
+  if (addCursorMode) {
+    state.mouseDown = false;
+    state.dragMode = 0;
+    addCursor(pos.row, pos.col);
+    render();
+    return;
+  }
   const now = Date.now();
   if (state.lastClickPane === 'editor' && now - state.lastClickTime < 400 &&
       state.lastClickRow === pos.row && Math.abs(state.lastClickCol - pos.col) <= 1) {
@@ -812,6 +827,7 @@ function selectEditorWord(row, col) {
   state.dragOriginStartCol = wb.start;
   state.dragOriginEndRow = row;
   state.dragOriginEndCol = wb.end;
+  syncSelectionsFromLegacy(state);
 }
 
 function selectEditorLine(row) {
@@ -827,6 +843,7 @@ function selectEditorLine(row) {
   state.dragOriginStartCol = 0;
   state.dragOriginEndRow = cursorRow;
   state.dragOriginEndCol = cursorCol;
+  syncSelectionsFromLegacy(state);
 }
 
 function dragEditorCursorFromMouse(cx, cy) {
@@ -871,6 +888,7 @@ function dragEditorCursorFromMouse(cx, cy) {
   } else {
     moveCursor(pos.row, pos.col, true);
   }
+  syncSelectionsFromLegacy(state);
 
   if (cy <= state.layout.bodyTop && state.scrollY > 0) {
     state.scrollY = Math.max(0, state.scrollY - 1);

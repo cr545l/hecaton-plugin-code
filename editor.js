@@ -1,6 +1,15 @@
 const { state, setStatus } = require('./state');
 const { baseName, readTextFile, writeTextFile } = require('./fs-ops');
 const { wordLeft, wordRight } = require('./text');
+const {
+  emptySelection,
+  cloneSelection,
+  selectionIsEmpty,
+  selectionRange,
+  ensureSelections,
+  setSelections,
+  syncSelectionsFromLegacy,
+} = require('./cursor-state');
 
 const DEFAULT_TAB_SIZE = 2;
 const COALESCE_MS = 850;
@@ -43,33 +52,23 @@ function normalizedContentFromLines() {
 
 function clampCursor() {
   if (state.editLines.length === 0) state.editLines = [''];
-  state.cursorRow = Math.max(0, Math.min(state.cursorRow, state.editLines.length - 1));
-  state.cursorCol = Math.max(0, Math.min(state.cursorCol, state.editLines[state.cursorRow].length));
-  if (state.selAnchorRow >= state.editLines.length) {
-    state.selAnchorRow = state.editLines.length - 1;
-    state.selAnchorCol = state.editLines[state.selAnchorRow].length;
-  }
-  if (state.selAnchorRow >= 0) {
-    state.selAnchorRow = Math.max(0, state.selAnchorRow);
-    state.selAnchorCol = Math.max(0, Math.min(state.selAnchorCol, state.editLines[state.selAnchorRow].length));
-  }
+  ensureSelections(state);
 }
 
 function hasSelection() {
-  return state.selAnchorRow >= 0 &&
-    (state.selAnchorRow !== state.cursorRow || state.selAnchorCol !== state.cursorCol);
+  return ensureSelections(state).some(sel => !selectionIsEmpty(sel));
 }
 
 function clearSelection() {
-  state.selAnchorRow = -1;
-  state.selAnchorCol = -1;
+  const selections = ensureSelections(state).map(sel => emptySelection(sel.row, sel.col));
+  setSelections(state, selections);
 }
 
 function startSelection() {
-  if (state.selAnchorRow < 0) {
-    state.selAnchorRow = state.cursorRow;
-    state.selAnchorCol = state.cursorCol;
-  }
+  const selections = ensureSelections(state).map(sel =>
+    selectionIsEmpty(sel) ? emptySelection(sel.row, sel.col) : cloneSelection(sel)
+  );
+  setSelections(state, selections);
 }
 
 function comparePositions(aRow, aCol, bRow, bCol) {
@@ -83,8 +82,15 @@ function positionsEqual(aRow, aCol, bRow, bCol) {
 }
 
 function getSelectionRange() {
-  if (!hasSelection()) return null;
-  return normalizeRange(state.selAnchorRow, state.selAnchorCol, state.cursorRow, state.cursorCol);
+  const primary = ensureSelections(state)[0];
+  if (!primary || selectionIsEmpty(primary)) return null;
+  return selectionRange(primary);
+}
+
+function getSelectionRanges() {
+  return ensureSelections(state)
+    .filter(sel => !selectionIsEmpty(sel))
+    .map(selectionRange);
 }
 
 function normalizeRange(startRow, startCol, endRow, endCol) {
@@ -122,8 +128,9 @@ function textFromRange(r) {
 }
 
 function selectedText() {
-  const r = getSelectionRange();
-  return r ? textFromRange(r) : '';
+  const ranges = getSelectionRanges();
+  if (!ranges.length) return '';
+  return ranges.map(textFromRange).join('\n');
 }
 
 function rangeEndForText(startRow, startCol, text) {
@@ -153,12 +160,84 @@ function replaceRangeRaw(r, text) {
   return rangeEndForText(r.startRow, r.startCol, text);
 }
 
+function lineStartOffsets(lines) {
+  const offsets = [];
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    offsets.push(offset);
+    offset += (lines[i] || '').length + 1;
+  }
+  return offsets;
+}
+
+function positionToOffset(row, col, offsets) {
+  return offsets[row] + col;
+}
+
+function offsetToPosition(offset, text) {
+  offset = Math.max(0, Math.min(offset, text.length));
+  let row = 0;
+  let lineStart = 0;
+  for (let i = 0; i < offset; i++) {
+    if (text[i] === '\n') {
+      row++;
+      lineStart = i + 1;
+    }
+  }
+  return { row, col: offset - lineStart };
+}
+
+function replaceRangesRaw(edits) {
+  if (!edits.length) return [];
+  const beforeLines = state.editLines.slice();
+  const beforeText = beforeLines.join('\n');
+  const offsets = lineStartOffsets(beforeLines);
+  const normalized = edits.map((edit, index) => {
+    const range = cloneRange(edit.range);
+    const text = normalizeContent(edit.text);
+    const startOffset = positionToOffset(range.startRow, range.startCol, offsets);
+    const endOffset = positionToOffset(range.endRow, range.endCol, offsets);
+    return { ...edit, index, range, text, startOffset, endOffset };
+  }).sort((a, b) => a.startOffset - b.startOffset || a.endOffset - b.endOffset);
+
+  const filtered = [];
+  for (const edit of normalized) {
+    const last = filtered[filtered.length - 1];
+    if (last && edit.startOffset < last.endOffset) continue;
+    if (last && edit.startOffset === last.startOffset && edit.endOffset === last.endOffset) continue;
+    filtered.push(edit);
+  }
+
+  let out = '';
+  let cursor = 0;
+  let delta = 0;
+  const afterOffsets = new Array(filtered.length);
+  for (let i = 0; i < filtered.length; i++) {
+    const edit = filtered[i];
+    out += beforeText.substring(cursor, edit.startOffset);
+    const newStartOffset = edit.startOffset + delta;
+    out += edit.text;
+    cursor = edit.endOffset;
+    const replacementDelta = edit.text.length - (edit.endOffset - edit.startOffset);
+    delta += replacementDelta;
+    afterOffsets[i] = edit.afterOffset != null
+      ? newStartOffset + edit.afterOffset
+      : newStartOffset + edit.text.length;
+  }
+  out += beforeText.substring(cursor);
+
+  state.editLines = out.length ? out.split('\n') : [''];
+  return afterOffsets.map(offset => offsetToPosition(offset, out));
+}
+
 function captureCursorState() {
+  ensureSelections(state);
   return {
     cursorRow: state.cursorRow,
     cursorCol: state.cursorCol,
     selAnchorRow: state.selAnchorRow,
     selAnchorCol: state.selAnchorCol,
+    selections: state.selections.map(cloneSelection),
     desiredCol: state.desiredCol,
   };
 }
@@ -171,10 +250,15 @@ function captureSnapshotState() {
 }
 
 function restoreCursorState(s) {
-  state.cursorRow = s.cursorRow;
-  state.cursorCol = s.cursorCol;
-  state.selAnchorRow = s.selAnchorRow;
-  state.selAnchorCol = s.selAnchorCol;
+  if (Array.isArray(s.selections) && s.selections.length) {
+    state.selections = s.selections.map(cloneSelection);
+  } else {
+    state.cursorRow = s.cursorRow;
+    state.cursorCol = s.cursorCol;
+    state.selAnchorRow = s.selAnchorRow;
+    state.selAnchorCol = s.selAnchorCol;
+    syncSelectionsFromLegacy(state);
+  }
   state.desiredCol = s.desiredCol == null ? null : s.desiredCol;
   clampCursor();
 }
@@ -281,6 +365,7 @@ function replaceRange(r, text, type, afterCursor) {
     state.cursorRow = end.row;
     state.cursorCol = end.col;
   }
+  syncSelectionsFromLegacy(state);
   clearSelection();
   clampCursor();
 
@@ -306,6 +391,62 @@ function replaceRange(r, text, type, afterCursor) {
   pushHistory(entry);
   markDirty();
   return true;
+}
+
+function replaceSelections(text, type, afterOffset) {
+  if (state.readonly || !state.openPath) return false;
+  const selections = ensureSelections(state);
+  if (selections.length <= 1) {
+    const r = getSelectionRange() || emptyRangeAt(state.cursorRow, state.cursorCol);
+    let afterCursor = null;
+    if (afterOffset != null) {
+      const end = rangeEndForText(r.startRow, r.startCol, normalizeContent(text).substring(0, afterOffset));
+      afterCursor = end;
+    }
+    return replaceRange(r, text, type, afterCursor);
+  }
+
+  text = normalizeContent(text);
+  const ranges = selections.map(sel => selectionRange(sel));
+  const oldTexts = ranges.map(textFromRange);
+  if (oldTexts.every(oldText => oldText === text)) return false;
+
+  return commitSnapshotEdit(type || 'multi-edit', type || 'multi edit', () => {
+    const edits = ranges.map(range => ({
+      range,
+      text,
+      afterOffset,
+    }));
+    const positions = replaceRangesRaw(edits);
+    setSelections(state, positions.map(pos => emptySelection(pos.row, pos.col)));
+    return true;
+  });
+}
+
+function deleteSelectionRanges(type) {
+  const ranges = getSelectionRanges();
+  if (!ranges.length) return false;
+  if (ranges.length === 1 && ensureSelections(state).length === 1) {
+    return replaceRange(ranges[0], '', type || 'delete');
+  }
+  return commitSnapshotEdit(type || 'delete', type || 'delete', () => {
+    const positions = replaceRangesRaw(ranges.map(range => ({ range, text: '' })));
+    setSelections(state, positions.map(pos => emptySelection(pos.row, pos.col)));
+    return true;
+  });
+}
+
+function replaceCursorRanges(ranges, text, type) {
+  ranges = ranges.filter(r => !rangeIsEmpty(r));
+  if (!ranges.length) return false;
+  if (ranges.length === 1 && ensureSelections(state).length === 1) {
+    return replaceRange(ranges[0], text, type || 'edit');
+  }
+  return commitSnapshotEdit(type || 'multi-edit', type || 'multi edit', () => {
+    const positions = replaceRangesRaw(ranges.map(range => ({ range, text })));
+    setSelections(state, positions.map(pos => emptySelection(pos.row, pos.col)));
+    return true;
+  });
 }
 
 function commitSnapshotEdit(type, label, mutator) {
@@ -390,8 +531,7 @@ function insertText(text, type) {
   if (state.readonly || !state.openPath) return false;
   text = normalizeContent(text);
   if (!text) return false;
-  const r = getSelectionRange() || emptyRangeAt(state.cursorRow, state.cursorCol);
-  return replaceRange(r, text, type || 'insert');
+  return replaceSelections(text, type || 'insert');
 }
 
 function previousCharIndex(line, col) {
@@ -419,123 +559,109 @@ function nextCharIndex(line, col) {
 }
 
 function deleteSelectionOnly() {
-  const r = getSelectionRange();
-  if (!r) return false;
-  replaceRangeRaw(r, '');
-  state.cursorRow = r.startRow;
-  state.cursorCol = r.startCol;
-  clearSelection();
-  clampCursor();
-  return true;
+  return deleteSelectionRanges('delete');
 }
 
 function deleteSelection(type) {
-  const r = getSelectionRange();
-  if (!r) return false;
-  return replaceRange(r, '', type || 'delete');
+  return deleteSelectionRanges(type || 'delete');
 }
 
 function deleteBackward() {
   if (state.readonly || !state.openPath) return false;
   if (deleteSelection('delete')) return true;
 
-  if (state.cursorCol > 0) {
-    const line = state.editLines[state.cursorRow];
-    const prev = previousCharIndex(line, state.cursorCol);
-    return replaceRange(
-      normalizeRange(state.cursorRow, prev, state.cursorRow, state.cursorCol),
-      '',
-      'delete-backward'
-    );
-  }
-  if (state.cursorRow > 0) {
-    const prevLen = state.editLines[state.cursorRow - 1].length;
-    return replaceRange(
-      normalizeRange(state.cursorRow - 1, prevLen, state.cursorRow, 0),
-      '',
-      'delete-newline',
-      { row: state.cursorRow - 1, col: prevLen }
-    );
-  }
-  return false;
+  const ranges = ensureSelections(state).map(sel => {
+    if (sel.col > 0) {
+      const line = state.editLines[sel.row];
+      const prev = previousCharIndex(line, sel.col);
+      return normalizeRange(sel.row, prev, sel.row, sel.col);
+    }
+    if (sel.row > 0) {
+      const prevLen = state.editLines[sel.row - 1].length;
+      return normalizeRange(sel.row - 1, prevLen, sel.row, 0);
+    }
+    return null;
+  }).filter(Boolean);
+  return replaceCursorRanges(ranges, '', 'delete-backward');
 }
 
 function deleteForward() {
   if (state.readonly || !state.openPath) return false;
   if (deleteSelection('delete')) return true;
 
-  const line = state.editLines[state.cursorRow];
-  if (state.cursorCol < line.length) {
-    const next = nextCharIndex(line, state.cursorCol);
-    return replaceRange(
-      normalizeRange(state.cursorRow, state.cursorCol, state.cursorRow, next),
-      '',
-      'delete-forward'
-    );
-  }
-  if (state.cursorRow < state.editLines.length - 1) {
-    return replaceRange(
-      normalizeRange(state.cursorRow, state.cursorCol, state.cursorRow + 1, 0),
-      '',
-      'delete-newline'
-    );
-  }
-  return false;
+  const ranges = ensureSelections(state).map(sel => {
+    const line = state.editLines[sel.row];
+    if (sel.col < line.length) {
+      const next = nextCharIndex(line, sel.col);
+      return normalizeRange(sel.row, sel.col, sel.row, next);
+    }
+    if (sel.row < state.editLines.length - 1) {
+      return normalizeRange(sel.row, sel.col, sel.row + 1, 0);
+    }
+    return null;
+  }).filter(Boolean);
+  return replaceCursorRanges(ranges, '', 'delete-forward');
 }
 
 function deleteWordBackward() {
   if (state.readonly || !state.openPath) return false;
   if (deleteSelection('delete-word')) return true;
-  if (state.cursorCol > 0) {
-    const line = state.editLines[state.cursorRow] || '';
-    const col = wordLeft(line, state.cursorCol);
-    return replaceRange(normalizeRange(state.cursorRow, col, state.cursorRow, state.cursorCol), '', 'delete-word');
-  }
-  if (state.cursorRow > 0) {
-    const prevLen = state.editLines[state.cursorRow - 1].length;
-    return replaceRange(normalizeRange(state.cursorRow - 1, prevLen, state.cursorRow, 0), '', 'delete-word');
-  }
-  return false;
+  const ranges = ensureSelections(state).map(sel => {
+    if (sel.col > 0) {
+      const line = state.editLines[sel.row] || '';
+      const col = wordLeft(line, sel.col);
+      return normalizeRange(sel.row, col, sel.row, sel.col);
+    }
+    if (sel.row > 0) {
+      const prevLen = state.editLines[sel.row - 1].length;
+      return normalizeRange(sel.row - 1, prevLen, sel.row, 0);
+    }
+    return null;
+  }).filter(Boolean);
+  return replaceCursorRanges(ranges, '', 'delete-word');
 }
 
 function deleteWordForward() {
   if (state.readonly || !state.openPath) return false;
   if (deleteSelection('delete-word')) return true;
-  const line = state.editLines[state.cursorRow] || '';
-  if (state.cursorCol < line.length) {
-    const col = wordRight(line, state.cursorCol);
-    return replaceRange(normalizeRange(state.cursorRow, state.cursorCol, state.cursorRow, col), '', 'delete-word');
-  }
-  if (state.cursorRow < state.editLines.length - 1) {
-    return replaceRange(normalizeRange(state.cursorRow, state.cursorCol, state.cursorRow + 1, 0), '', 'delete-word');
-  }
-  return false;
+  const ranges = ensureSelections(state).map(sel => {
+    const line = state.editLines[sel.row] || '';
+    if (sel.col < line.length) {
+      const col = wordRight(line, sel.col);
+      return normalizeRange(sel.row, sel.col, sel.row, col);
+    }
+    if (sel.row < state.editLines.length - 1) {
+      return normalizeRange(sel.row, sel.col, sel.row + 1, 0);
+    }
+    return null;
+  }).filter(Boolean);
+  return replaceCursorRanges(ranges, '', 'delete-word');
 }
 
 function deleteToLineStart() {
   if (state.readonly || !state.openPath) return false;
   if (deleteSelection('delete-line-start')) return true;
-  if (state.cursorCol > 0) {
-    return replaceRange(normalizeRange(state.cursorRow, 0, state.cursorRow, state.cursorCol), '', 'delete-line-start');
-  }
-  if (state.cursorRow > 0) {
-    const prevLen = state.editLines[state.cursorRow - 1].length;
-    return replaceRange(normalizeRange(state.cursorRow - 1, prevLen, state.cursorRow, 0), '', 'delete-line-start');
-  }
-  return false;
+  const ranges = ensureSelections(state).map(sel => {
+    if (sel.col > 0) return normalizeRange(sel.row, 0, sel.row, sel.col);
+    if (sel.row > 0) {
+      const prevLen = state.editLines[sel.row - 1].length;
+      return normalizeRange(sel.row - 1, prevLen, sel.row, 0);
+    }
+    return null;
+  }).filter(Boolean);
+  return replaceCursorRanges(ranges, '', 'delete-line-start');
 }
 
 function deleteToLineEnd() {
   if (state.readonly || !state.openPath) return false;
   if (deleteSelection('delete-line-end')) return true;
-  const line = state.editLines[state.cursorRow] || '';
-  if (state.cursorCol < line.length) {
-    return replaceRange(normalizeRange(state.cursorRow, state.cursorCol, state.cursorRow, line.length), '', 'delete-line-end');
-  }
-  if (state.cursorRow < state.editLines.length - 1) {
-    return replaceRange(normalizeRange(state.cursorRow, line.length, state.cursorRow + 1, 0), '', 'delete-line-end');
-  }
-  return false;
+  const ranges = ensureSelections(state).map(sel => {
+    const line = state.editLines[sel.row] || '';
+    if (sel.col < line.length) return normalizeRange(sel.row, sel.col, sel.row, line.length);
+    if (sel.row < state.editLines.length - 1) return normalizeRange(sel.row, line.length, sel.row + 1, 0);
+    return null;
+  }).filter(Boolean);
+  return replaceCursorRanges(ranges, '', 'delete-line-end');
 }
 
 function getSelectedLineBounds() {
@@ -560,6 +686,7 @@ function deleteLine() {
       state.cursorRow = Math.min(bounds.start, state.editLines.length - 1);
       state.cursorCol = Math.min(state.cursorCol, state.editLines[state.cursorRow].length);
     }
+    syncSelectionsFromLegacy(state);
     clearSelection();
     return true;
   });
@@ -567,75 +694,179 @@ function deleteLine() {
 
 function moveCursor(row, col, selecting) {
   state.scrollFreed = false;
-  if (selecting) startSelection();
-  else clearSelection();
-  state.cursorRow = Math.max(0, Math.min(row, state.editLines.length - 1));
-  state.cursorCol = Math.max(0, Math.min(col, state.editLines[state.cursorRow].length));
-  if (!selecting && state.selAnchorRow >= 0) clearSelection();
+  const current = ensureSelections(state)[0] || emptySelection(0, 0);
+  row = Math.max(0, Math.min(row, state.editLines.length - 1));
+  col = Math.max(0, Math.min(col, state.editLines[row].length));
+  setSelections(state, [{
+    anchorRow: selecting ? current.anchorRow : row,
+    anchorCol: selecting ? current.anchorCol : col,
+    row,
+    col,
+  }]);
 }
 
 function moveVertical(delta, selecting) {
-  if (state.desiredCol == null) state.desiredCol = state.cursorCol;
-  const row = Math.max(0, Math.min(state.cursorRow + delta, state.editLines.length - 1));
-  const col = Math.min(state.desiredCol, state.editLines[row].length);
-  moveCursor(row, col, selecting);
+  const selections = ensureSelections(state).map(sel => {
+    const desired = sel.desiredCol == null ? sel.col : sel.desiredCol;
+    const row = Math.max(0, Math.min(sel.row + delta, state.editLines.length - 1));
+    const col = Math.min(desired, state.editLines[row].length);
+    return {
+      anchorRow: selecting ? sel.anchorRow : row,
+      anchorCol: selecting ? sel.anchorCol : col,
+      row,
+      col,
+      desiredCol: desired,
+    };
+  });
+  setSelections(state, selections);
 }
 
 function moveHorizontal(delta, selecting) {
   state.desiredCol = null;
-  if (!selecting && hasSelection()) {
-    const r = getSelectionRange();
-    if (delta < 0) moveCursor(r.startRow, r.startCol, false);
-    else moveCursor(r.endRow, r.endCol, false);
-    return;
-  }
-  if (delta < 0) {
-    if (state.cursorCol > 0) moveCursor(state.cursorRow, previousCharIndex(state.editLines[state.cursorRow], state.cursorCol), selecting);
-    else if (state.cursorRow > 0) moveCursor(state.cursorRow - 1, state.editLines[state.cursorRow - 1].length, selecting);
-  } else {
-    const line = state.editLines[state.cursorRow] || '';
-    if (state.cursorCol < line.length) moveCursor(state.cursorRow, nextCharIndex(line, state.cursorCol), selecting);
-    else if (state.cursorRow < state.editLines.length - 1) moveCursor(state.cursorRow + 1, 0, selecting);
-  }
+  const selections = ensureSelections(state).map(sel => {
+    let row = sel.row;
+    let col = sel.col;
+    if (!selecting && !selectionIsEmpty(sel)) {
+      const r = selectionRange(sel);
+      row = delta < 0 ? r.startRow : r.endRow;
+      col = delta < 0 ? r.startCol : r.endCol;
+    } else if (delta < 0) {
+      if (col > 0) col = previousCharIndex(state.editLines[row], col);
+      else if (row > 0) {
+        row--;
+        col = state.editLines[row].length;
+      }
+    } else {
+      const line = state.editLines[row] || '';
+      if (col < line.length) col = nextCharIndex(line, col);
+      else if (row < state.editLines.length - 1) {
+        row++;
+        col = 0;
+      }
+    }
+    return {
+      anchorRow: selecting ? sel.anchorRow : row,
+      anchorCol: selecting ? sel.anchorCol : col,
+      row,
+      col,
+    };
+  });
+  setSelections(state, selections);
 }
 
 function moveWord(delta, selecting) {
   state.desiredCol = null;
-  const line = state.editLines[state.cursorRow] || '';
-  if (delta < 0) {
-    if (state.cursorCol > 0) moveCursor(state.cursorRow, wordLeft(line, state.cursorCol), selecting);
-    else if (state.cursorRow > 0) moveCursor(state.cursorRow - 1, state.editLines[state.cursorRow - 1].length, selecting);
-  } else {
-    if (state.cursorCol < line.length) moveCursor(state.cursorRow, wordRight(line, state.cursorCol), selecting);
-    else if (state.cursorRow < state.editLines.length - 1) moveCursor(state.cursorRow + 1, 0, selecting);
-  }
+  const selections = ensureSelections(state).map(sel => {
+    let row = sel.row;
+    let col = sel.col;
+    const line = state.editLines[row] || '';
+    if (delta < 0) {
+      if (col > 0) col = wordLeft(line, col);
+      else if (row > 0) {
+        row--;
+        col = state.editLines[row].length;
+      }
+    } else {
+      if (col < line.length) col = wordRight(line, col);
+      else if (row < state.editLines.length - 1) {
+        row++;
+        col = 0;
+      }
+    }
+    return {
+      anchorRow: selecting ? sel.anchorRow : row,
+      anchorCol: selecting ? sel.anchorCol : col,
+      row,
+      col,
+    };
+  });
+  setSelections(state, selections);
 }
 
 function moveHome(selecting) {
   state.desiredCol = null;
-  const line = state.editLines[state.cursorRow] || '';
-  const first = line.search(/\S/);
-  const indent = first < 0 ? 0 : first;
-  moveCursor(state.cursorRow, state.cursorCol === indent ? 0 : indent, selecting);
+  const selections = ensureSelections(state).map(sel => {
+    const line = state.editLines[sel.row] || '';
+    const first = line.search(/\S/);
+    const indent = first < 0 ? 0 : first;
+    const col = sel.col === indent ? 0 : indent;
+    return {
+      anchorRow: selecting ? sel.anchorRow : sel.row,
+      anchorCol: selecting ? sel.anchorCol : col,
+      row: sel.row,
+      col,
+    };
+  });
+  setSelections(state, selections);
+}
+
+function moveLineEnd(selecting) {
+  state.desiredCol = null;
+  const selections = ensureSelections(state).map(sel => {
+    const col = (state.editLines[sel.row] || '').length;
+    return {
+      anchorRow: selecting ? sel.anchorRow : sel.row,
+      anchorCol: selecting ? sel.anchorCol : col,
+      row: sel.row,
+      col,
+    };
+  });
+  setSelections(state, selections);
 }
 
 function moveDocumentStart(selecting) {
   state.desiredCol = null;
-  moveCursor(0, 0, selecting);
+  const selections = ensureSelections(state).map(sel => ({
+    anchorRow: selecting ? sel.anchorRow : 0,
+    anchorCol: selecting ? sel.anchorCol : 0,
+    row: 0,
+    col: 0,
+  }));
+  setSelections(state, selections);
 }
 
 function moveDocumentEnd(selecting) {
   state.desiredCol = null;
   const row = state.editLines.length - 1;
-  moveCursor(row, state.editLines[row].length, selecting);
+  const col = state.editLines[row].length;
+  const selections = ensureSelections(state).map(sel => ({
+    anchorRow: selecting ? sel.anchorRow : row,
+    anchorCol: selecting ? sel.anchorCol : col,
+    row,
+    col,
+  }));
+  setSelections(state, selections);
 }
 
 function selectAll() {
   state.scrollFreed = false;
-  state.selAnchorRow = 0;
-  state.selAnchorCol = 0;
-  state.cursorRow = state.editLines.length - 1;
-  state.cursorCol = state.editLines[state.cursorRow].length;
+  const row = state.editLines.length - 1;
+  setSelections(state, [{
+    anchorRow: 0,
+    anchorCol: 0,
+    row,
+    col: state.editLines[row].length,
+  }]);
+}
+
+function addCursor(row, col) {
+  if (!state.openPath) return false;
+  row = Math.max(0, Math.min(row, state.editLines.length - 1));
+  col = Math.max(0, Math.min(col, state.editLines[row].length));
+  const selections = ensureSelections(state).concat([emptySelection(row, col)]);
+  setSelections(state, selections);
+  setStatus(state.selections.length + ' cursors', 'info', 1200);
+  return true;
+}
+
+function addCursorVertical(delta) {
+  if (!state.openPath) return false;
+  const selections = ensureSelections(state);
+  const base = selections[selections.length - 1] || selections[0];
+  const row = Math.max(0, Math.min(base.row + delta, state.editLines.length - 1));
+  if (row === base.row) return false;
+  const col = Math.min(base.col, state.editLines[row].length);
+  return addCursor(row, col);
 }
 
 function indentUnit() {
@@ -660,6 +891,7 @@ function indentLines() {
     }
     state.cursorCol = cursor.col;
     if (anchor.row >= 0) state.selAnchorCol = anchor.col;
+    syncSelectionsFromLegacy(state);
     return true;
   });
 }
@@ -688,6 +920,7 @@ function outdentLines() {
     }
     state.cursorCol = cursor.col;
     if (anchor.row >= 0) state.selAnchorCol = anchor.col;
+    syncSelectionsFromLegacy(state);
     return changed;
   });
 }
@@ -700,6 +933,7 @@ function duplicateLines() {
     const offset = block.length;
     state.cursorRow += offset;
     if (state.selAnchorRow >= 0) state.selAnchorRow += offset;
+    syncSelectionsFromLegacy(state);
     return true;
   });
 }
@@ -715,6 +949,7 @@ function moveLines(delta) {
     state.editLines.splice(insertAt, 0, ...block);
     state.cursorRow += delta;
     if (state.selAnchorRow >= 0) state.selAnchorRow += delta;
+    syncSelectionsFromLegacy(state);
     return true;
   });
 }
@@ -765,6 +1000,24 @@ function toggleLineComment() {
 function tryInsertPair(ch) {
   if (!Object.prototype.hasOwnProperty.call(PAIRS, ch) || state.readonly || !state.openPath) return false;
   const close = PAIRS[ch];
+  const selections = ensureSelections(state);
+  if (selections.length > 1) {
+    return commitSnapshotEdit('insert-pair', 'insert pair', () => {
+      const edits = selections.map(sel => {
+        const range = selectionRange(sel);
+        const selected = selectionIsEmpty(sel) ? '' : textFromRange(range);
+        const text = ch + selected + close;
+        return {
+          range,
+          text,
+          afterOffset: selected ? text.length : ch.length,
+        };
+      });
+      const positions = replaceRangesRaw(edits);
+      setSelections(state, positions.map(pos => emptySelection(pos.row, pos.col)));
+      return true;
+    });
+  }
   const line = state.editLines[state.cursorRow] || '';
 
   if (ch === close && line[state.cursorCol] === close && !hasSelection()) {
@@ -783,8 +1036,9 @@ function tryInsertPair(ch) {
 }
 
 function trySkipClosingPair(ch) {
-  const line = state.editLines[state.cursorRow] || '';
-  if (Object.values(PAIRS).includes(ch) && line[state.cursorCol] === ch && !hasSelection()) {
+  const selections = ensureSelections(state);
+  if (Object.values(PAIRS).includes(ch) && !hasSelection() &&
+      selections.every(sel => (state.editLines[sel.row] || '')[sel.col] === ch)) {
     moveHorizontal(1, false);
     return true;
   }
@@ -792,16 +1046,17 @@ function trySkipClosingPair(ch) {
 }
 
 function tryDeletePairBackward() {
-  if (state.cursorCol <= 0 || hasSelection() || state.readonly || !state.openPath) return false;
-  const line = state.editLines[state.cursorRow] || '';
-  const prev = line[state.cursorCol - 1];
-  const next = line[state.cursorCol];
-  if (!prev || PAIRS[prev] !== next) return false;
-  return replaceRange(
-    normalizeRange(state.cursorRow, state.cursorCol - 1, state.cursorRow, state.cursorCol + 1),
-    '',
-    'delete-pair'
-  );
+  if (hasSelection() || state.readonly || !state.openPath) return false;
+  const ranges = ensureSelections(state).map(sel => {
+    if (sel.col <= 0) return null;
+    const line = state.editLines[sel.row] || '';
+    const prev = line[sel.col - 1];
+    const next = line[sel.col];
+    if (!prev || PAIRS[prev] !== next) return null;
+    return normalizeRange(sel.row, sel.col - 1, sel.row, sel.col + 1);
+  });
+  if (ranges.some(r => !r)) return false;
+  return replaceCursorRanges(ranges, '', 'delete-pair');
 }
 
 function findInLine(line, query, start, reverse, caseSensitive) {
@@ -899,6 +1154,7 @@ function selectFoundMatch(query, row, col) {
   state.selAnchorCol = col;
   state.cursorRow = row;
   state.cursorCol = col + query.length;
+  syncSelectionsFromLegacy(state);
   clampCursor();
   const total = countFindMatches(query);
   const index = countMatchesBefore(query, row, col) + 1;
@@ -955,6 +1211,7 @@ async function openFile(filePath, opts) {
     state.fileMtimeMs = result.mtime || 0;
     state.fileSizeBytes = result.size || 0;
     resetHistory();
+    syncSelectionsFromLegacy(state);
     clearSelection();
     setStatus(result.error || 'Cannot open file', result.binary ? 'info' : 'error', 3000);
     return false;
@@ -977,6 +1234,7 @@ async function openFile(filePath, opts) {
   state.fileSizeBytes = result.size || result.content.length;
   state.findQuery = '';
   resetHistory();
+  syncSelectionsFromLegacy(state);
   clearSelection();
   if (!opts.keepFocus) state.focus = 'editor';
   setStatus('Opened ' + state.openName, 'info', 1800);
@@ -1031,6 +1289,7 @@ async function closeFile(force) {
   state.binary = false;
   state.findQuery = '';
   resetHistory();
+  syncSelectionsFromLegacy(state);
   clearSelection();
   setStatus('Closed file', 'info', 1500);
   return true;
@@ -1045,6 +1304,7 @@ module.exports = {
   clearSelection,
   startSelection,
   getSelectionRange,
+  getSelectionRanges,
   selectedText,
   currentLineText,
   deleteSelectionOnly,
@@ -1076,9 +1336,12 @@ module.exports = {
   moveHorizontal,
   moveWord,
   moveHome,
+  moveLineEnd,
   moveDocumentStart,
   moveDocumentEnd,
   selectAll,
+  addCursor,
+  addCursorVertical,
   findNext,
   gotoLine,
   countFindMatches,

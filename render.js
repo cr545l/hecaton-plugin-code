@@ -8,7 +8,7 @@ const {
   visibleSlice,
   sanitizeDisplayText,
 } = require('./text');
-const { getSelectionRange, hasSelection, countFindMatches, canUndo, canRedo } = require('./editor');
+const { getSelectionRanges, hasSelection, countFindMatches, canUndo, canRedo } = require('./editor');
 const { highlightLine, getLanguage } = require('./highlighter');
 const {
   CURSOR_PALETTE,
@@ -556,9 +556,7 @@ function sliceAnsiPlainRange(highlighted, startChar, endChar) {
 }
 
 function selectionTouchesLine(lineIdx) {
-  const r = getSelectionRange();
-  if (!r) return false;
-  return lineIdx >= r.startRow && lineIdx <= r.endRow;
+  return getSelectionRanges().some(r => lineIdx >= r.startRow && lineIdx <= r.endRow);
 }
 
 function findRangesForLine(lineIdx) {
@@ -581,7 +579,7 @@ function isFindMatch(col, ranges) {
 }
 
 function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar, findRanges) {
-  const sel = getSelectionRange();
+  const selections = getSelectionRanges();
   let out = '';
   let plainOffset = 0;
   let i = 0;
@@ -599,7 +597,7 @@ function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar, findR
     const cp = highlighted.codePointAt(i);
     const ch = String.fromCodePoint(cp);
     const absolute = startChar + plainOffset;
-    const selected = sel && isSelected(lineIdx, absolute, sel);
+    const selected = selections.some(sel => isSelected(lineIdx, absolute, sel));
     const found = !selected && isFindMatch(absolute, findRanges || []);
     if (selected) out += ansi.inverse + ch + ansi.noInverse;
     else if (found) out += ansi.underline + ch + ansi.noUnderline;
@@ -618,24 +616,30 @@ function renderEditorCursorOverlay() {
   const layout = state.layout;
   const gutterW = layout.gutterW;
   const contentW = Math.max(1, layout.editorW - 1 - gutterW - 2);
-  const cursorDisplayCol = stringWidth((state.editLines[state.cursorRow] || '').substring(0, state.cursorCol));
-  const row = layout.bodyTop + (state.cursorRow - state.scrollY);
-  const col = layout.editorCol + gutterW + 2 + (cursorDisplayCol - state.scrollX);
-  const visible = row >= layout.bodyTop &&
-    row < layout.bodyTop + layout.bodyH &&
-    col >= layout.editorCol + gutterW + 2 &&
-    col < layout.editorCol + gutterW + 2 + contentW;
+  const selections = (state.selections && state.selections.length ? state.selections : [{
+    row: state.cursorRow,
+    col: state.cursorCol,
+  }]);
+  const pixels = state.cursorBlinkOn ? renderCursorPixels(state.cellW, state.cellH) : null;
+  const sixel = pixels ? encodeSixel(pixels, state.cellW, state.cellH, CURSOR_PALETTE) : '';
 
-  if (!visible) return;
+  for (const sel of selections) {
+    const cursorDisplayCol = stringWidth((state.editLines[sel.row] || '').substring(0, sel.col));
+    const row = layout.bodyTop + (sel.row - state.scrollY);
+    const col = layout.editorCol + gutterW + 2 + (cursorDisplayCol - state.scrollX);
+    const visible = row >= layout.bodyTop &&
+      row < layout.bodyTop + layout.bodyH &&
+      col >= layout.editorCol + gutterW + 2 &&
+      col < layout.editorCol + gutterW + 2 + contentW;
 
-  if (!state.cursorBlinkOn) {
-    process.stdout.write(ansi.moveTo(row, col) + encodeClearSixel(state.cellW, state.cellH));
-    return;
+    if (!visible) continue;
+
+    if (!state.cursorBlinkOn) {
+      process.stdout.write(ansi.moveTo(row, col) + encodeClearSixel(state.cellW, state.cellH));
+    } else {
+      process.stdout.write(ansi.moveTo(row, col) + sixel);
+    }
   }
-
-  const pixels = renderCursorPixels(state.cellW, state.cellH);
-  const sixel = encodeSixel(pixels, state.cellW, state.cellH, CURSOR_PALETTE);
-  process.stdout.write(ansi.moveTo(row, col) + sixel);
 }
 
 function isSelected(row, col, sel) {
@@ -665,6 +669,7 @@ function renderEditorStatusInfo() {
     'Ln ' + (state.cursorRow + 1) + '/' + state.editLines.length,
     'Col ' + (state.cursorCol + 1),
   ];
+  if (state.selections && state.selections.length > 1) parts.push(state.selections.length + ' cursors');
   if (hasSelection()) parts.push(selectionSummary());
   if (state.undoStack.length || state.redoStack.length) parts.push('U ' + state.undoStack.length + ' R ' + state.redoStack.length);
   if (state.findQuery) parts.push('Find ' + countFindMatches(state.findQuery));
@@ -677,8 +682,10 @@ function renderEditorStatusInfo() {
 }
 
 function selectionSummary() {
-  const r = getSelectionRange();
-  if (!r) return '';
+  const ranges = getSelectionRanges();
+  if (!ranges.length) return '';
+  if (ranges.length > 1) return 'Sel ' + ranges.length + ' ranges';
+  const r = ranges[0];
   if (r.startRow === r.endRow) return 'Sel ' + Math.max(0, r.endCol - r.startCol);
   return 'Sel ' + (r.endRow - r.startRow + 1) + ' lines';
 }

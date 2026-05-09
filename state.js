@@ -36,6 +36,9 @@ const state = {
 
   selAnchorRow: -1,
   selAnchorCol: -1,
+  selections: [
+    { anchorRow: 0, anchorCol: 0, row: 0, col: 0 },
+  ],
   mouseDown: false,
   dragging: null,
   panDragStart: null,
