@@ -464,7 +464,7 @@ async function handleMouseData(data) {
     const inEditorCols = !state.editorCollapsed &&
       cx >= state.layout.editorCol &&
       cx <= state.layout.editorScrollCol;
-    const inEditorWheelArea = inEditorCols && (inBody || cy === state.layout.bottomSepRow);
+    const inEditorWheelArea = inEditorCols && (inBody || cy === state.layout.editorHScrollRow);
 
     if ((isHorizontalWheel || isShiftWheel) && state.openPath && inEditorWheelArea) {
       state.focus = 'editor';
@@ -702,7 +702,7 @@ function isEditorHScrollCell(cx, cy) {
   return !state.editorCollapsed &&
     state.openPath &&
     getMaxEditorScrollX() > 0 &&
-    cy === state.layout.bottomSepRow &&
+    cy === state.layout.editorHScrollRow &&
     cx >= state.layout.editorCol &&
     cx < state.layout.editorCol + trackCols;
 }

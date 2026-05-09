@@ -89,6 +89,7 @@ const state = {
     treeScrollCol: 31,
     editorScrollCol: 80,
     gutterW: 4,
+    editorHScrollRow: 0,
     titleZones: [],
     titleDividerOffsets: [],
     activityZones: [],

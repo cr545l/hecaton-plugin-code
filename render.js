@@ -56,10 +56,14 @@ function render() {
   const sepRow = 2;
   const bottomSepRow = rows - 1;
   const statusRow = rows;
-  const bodyH = Math.max(1, bottomSepRow - bodyTop);
   const layout = computePanelLayout(contentCols);
   const treeW = layout.treeW;
   const editorW = layout.editorW;
+  const gutterW = Math.max(3, String(state.editLines.length).length) + 1;
+  const editorContentW = Math.max(1, editorW - gutterW - 3);
+  const hasEditorHScroll = layout.hasEditor && state.openPath && getMaxEditorScrollX(editorContentW) > 0;
+  const bodyH = Math.max(1, bottomSepRow - bodyTop - (hasEditorHScroll ? 1 : 0));
+  const editorHScrollRow = hasEditorHScroll ? bodyTop + bodyH : 0;
   const contentCol = activityW + 1;
   const treeCol = layout.hasTree ? contentCol : 0;
   const dividerCol = layout.dividerVisible ? activityW + layout.dividerCol : 0;
@@ -81,7 +85,8 @@ function render() {
     editorCol,
     treeScrollCol: layout.hasTree ? activityW + treeW : 0,
     editorScrollCol: layout.hasEditor ? cols : 0,
-    gutterW: Math.max(3, String(state.editLines.length).length) + 1,
+    gutterW,
+    editorHScrollRow,
     titleZones: [],
     titleDividerOffsets: [],
     activityZones: [],
@@ -106,6 +111,9 @@ function render() {
     out.push(line);
   }
 
+  if (hasEditorHScroll) {
+    out.push(ansi.moveTo(editorHScrollRow, 1) + renderActivityRail(editorHScrollRow) + renderEditorHScrollbarRow(layout));
+  }
   out.push(ansi.moveTo(bottomSepRow, 1) + renderActivityRail(bottomSepRow, BOX.T_RIGHT) + renderBottomSeparator(layout));
   out.push(ansi.moveTo(statusRow, 1) + renderActivityRail(statusRow) + renderStatus(contentCols));
   process.stdout.write(out.join(''));
@@ -330,21 +338,34 @@ function buildContentSeparator(width, aboveOffsets, belowOffsets) {
 function renderBottomSeparator(layout) {
   const leftPct = scrollPct(state.treeScroll, Math.max(0, state.treeEntries.length - state.layout.bodyH));
   const rightPct = scrollPct(state.scrollY, Math.max(0, state.editLines.length - state.layout.bodyH));
-  const contentW = getEditorContentWidth(layout.editorW);
-  const maxScrollX = getMaxEditorScrollX(contentW);
   let line = colors.border;
   if (layout.hasTree) line += labelOnRule(layout.treeW, leftPct >= 0 ? leftPct + '%' : '');
   if (layout.dividerVisible) line += BOX.T_UP;
   if (layout.hasEditor) {
-    if (state.openPath && maxScrollX > 0 && useSixelScrollbars()) {
-      line += ' '.repeat(layout.editorW);
-    } else if (state.openPath && maxScrollX > 0) {
-      line += renderHorizontalScrollbar(layout.editorW, contentW, state.scrollX, maxScrollX);
-    } else {
-      line += labelOnRule(layout.editorW, rightPct >= 0 ? rightPct + '%' : '');
-    }
+    line += labelOnRule(layout.editorW, rightPct >= 0 ? rightPct + '%' : '');
   }
   return line + ansi.reset;
+}
+
+function renderEditorHScrollbarRow(layout) {
+  const contentW = getEditorContentWidth(layout.editorW);
+  const maxScrollX = getMaxEditorScrollX(contentW);
+  const editorMaxY = Math.max(0, state.editLines.length - state.layout.bodyH);
+  const trackCols = getEditorHScrollbarTrackCols(layout.editorW, editorMaxY > 0);
+  let line = '';
+  if (layout.hasTree) line += ' '.repeat(layout.treeW);
+  if (layout.dividerVisible) line += colors.border + BOX.V + ansi.reset;
+  if (layout.hasEditor) {
+    if (maxScrollX > 0 && useSixelScrollbars()) {
+      line += ' '.repeat(layout.editorW);
+    } else if (maxScrollX > 0) {
+      line += renderHorizontalScrollbar(trackCols, contentW, state.scrollX, maxScrollX);
+      line += ' '.repeat(Math.max(0, layout.editorW - trackCols));
+    } else {
+      line += ' '.repeat(layout.editorW);
+    }
+  }
+  return line;
 }
 
 function labelOnRule(width, label) {
@@ -741,7 +762,7 @@ function renderScrollbarOverlays() {
       if (pix) {
         const active = state.dragging === 'editor-hscrollbar';
         const palette = active ? SCROLLBAR_ACTIVE_PALETTE : SCROLLBAR_PALETTE;
-        process.stdout.write(ansi.moveTo(layout.bottomSepRow, layout.editorCol) +
+        process.stdout.write(ansi.moveTo(layout.editorHScrollRow || layout.bottomSepRow, layout.editorCol) +
           encodeSixel(pix, hTrackCols * state.cellW, state.cellH, palette));
       }
     }
