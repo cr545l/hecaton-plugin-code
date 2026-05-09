@@ -8,7 +8,7 @@ const {
   visibleSlice,
   sanitizeDisplayText,
 } = require('./text');
-const { getSelectionRange, hasSelection, countFindMatches } = require('./editor');
+const { getSelectionRange, hasSelection, countFindMatches, canUndo, canRedo } = require('./editor');
 const { highlightLine, getLanguage } = require('./highlighter');
 const {
   CURSOR_PALETTE,
@@ -35,24 +35,68 @@ function resetInlineStyle() {
   return ansi.noBold + ansi.noItalic + ansi.noUnderline + ansi.noInverse + ansi.fg.default + ansi.bg.default;
 }
 
+const ACTIVITY_BAR_W = 4;
+const BOX = {
+  H: '\u2500',
+  V: '\u2502',
+  CROSS: '\u253c',
+  T_DOWN: '\u252c',
+  T_UP: '\u2534',
+  T_RIGHT: '\u251c',
+};
+const CODICON_CODEPOINTS = {
+  'add': 0xea60,
+  'comment': 0xea6b,
+  'search': 0xea6d,
+  'close': 0xea76,
+  'file': 0xea7b,
+  'new-file': 0xea7f,
+  'folder-opened': 0xeaf7,
+  'files': 0xeaf0,
+  'go-to-file': 0xea94,
+  'discard': 0xeae2,
+  'edit': 0xea73,
+  'clippy': 0xeac0,
+  'refresh': 0xeb37,
+  'save': 0xeb4b,
+  'split-horizontal': 0xeb56,
+  'redo': 0xebb0,
+  'copy': 0xebcc,
+  'layout': 0xebeb,
+  'layout-sidebar-left': 0xebf3,
+  'remove': 0xeb3b,
+  'question': 0xeb32,
+};
+
+function codicon(name) {
+  return String.fromCodePoint(CODICON_CODEPOINTS[name] || CODICON_CODEPOINTS.question);
+}
+
 function render() {
   clearExpiredStatus();
   if (state.minimized) return renderMinimized();
 
   const rows = Math.max(7, state.termRows || 24);
   const cols = Math.max(40, state.termCols || 80);
-  const bodyTop = 4;
-  const sepRow = 3;
+  const activityW = Math.min(ACTIVITY_BAR_W, Math.max(0, cols - 24));
+  const contentCols = Math.max(1, cols - activityW);
+  const bodyTop = 3;
+  const sepRow = 2;
   const bottomSepRow = rows - 1;
   const statusRow = rows;
   const bodyH = Math.max(1, bottomSepRow - bodyTop);
-  const layout = computePanelLayout(cols);
+  const layout = computePanelLayout(contentCols);
   const treeW = layout.treeW;
   const editorW = layout.editorW;
-  const dividerCol = layout.dividerCol;
-  const editorCol = layout.editorCol;
+  const contentCol = activityW + 1;
+  const treeCol = layout.hasTree ? contentCol : 0;
+  const dividerCol = layout.dividerVisible ? activityW + layout.dividerCol : 0;
+  const editorCol = layout.hasEditor ? activityW + layout.editorCol : cols + 1;
 
   state.layout = {
+    activityW,
+    contentCol,
+    treeCol,
     treeW,
     editorW,
     bodyTop,
@@ -63,10 +107,12 @@ function render() {
     dividerCol,
     dividerVisible: layout.dividerVisible,
     editorCol,
-    treeScrollCol: layout.hasTree ? treeW : 0,
+    treeScrollCol: layout.hasTree ? activityW + treeW : 0,
     editorScrollCol: layout.hasEditor ? cols : 0,
     gutterW: Math.max(3, String(state.editLines.length).length) + 1,
     titleZones: [],
+    titleDividerOffsets: [],
+    activityZones: [],
   };
 
   if (layout.hasTree) keepTreeCursorVisible(bodyH);
@@ -74,22 +120,22 @@ function render() {
 
   const out = [];
   out.push(ansi.clear + ansi.hideCursor);
-  out.push(ansi.moveTo(1, 1) + renderTitle(cols));
-  out.push(ansi.moveTo(2, 1) + renderPanelHeaders(layout));
-  out.push(ansi.moveTo(sepRow, 1) + renderSeparator(layout));
+  out.push(ansi.moveTo(1, 1) + renderActivityRail(1) + renderTitle(contentCols));
+  out.push(ansi.moveTo(sepRow, 1) + renderActivityRail(sepRow, BOX.T_RIGHT) + renderSeparator(layout));
 
   const treeLines = layout.hasTree ? renderTreeLines(treeW, bodyH) : [];
   const editorLines = layout.hasEditor ? renderEditorLines(editorW, bodyH) : [];
   for (let i = 0; i < bodyH; i++) {
     let line = ansi.moveTo(bodyTop + i, 1);
+    line += renderActivityRail(bodyTop + i);
     if (layout.hasTree) line += treeLines[i];
     if (layout.dividerVisible) line += colors.border + '\u2502' + ansi.reset;
     if (layout.hasEditor) line += editorLines[i];
     out.push(line);
   }
 
-  out.push(ansi.moveTo(bottomSepRow, 1) + renderBottomSeparator(layout));
-  out.push(ansi.moveTo(statusRow, 1) + renderStatus(cols));
+  out.push(ansi.moveTo(bottomSepRow, 1) + renderActivityRail(bottomSepRow, BOX.T_RIGHT) + renderBottomSeparator(layout));
+  out.push(ansi.moveTo(statusRow, 1) + renderActivityRail(statusRow) + renderStatus(contentCols));
   process.stdout.write(out.join(''));
   renderScrollbarOverlays();
   renderEditorCursorOverlay();
@@ -133,38 +179,139 @@ function renderMinimized() {
   process.stdout.write(ansi.clear + ansi.hideCursor + ansi.moveTo(1, 1) + fit(colors.title + title + marker + ansi.reset, cols));
 }
 
+function renderActivityRail(row, boundaryChar) {
+  const width = state.layout.activityW || 0;
+  if (width <= 0) return '';
+
+  const iconW = Math.max(1, width - 1);
+  let icon = ' ';
+  let active = false;
+  let focused = false;
+  let action = '';
+
+  if (row === 1) {
+    icon = codicon('files');
+    active = !state.treeCollapsed;
+    focused = state.focus === 'tree';
+    action = 'toggle-tree';
+  } else if (row === 2) {
+    icon = codicon('edit');
+    active = !state.editorCollapsed;
+    focused = state.focus === 'editor';
+    action = 'toggle-editor';
+  }
+
+  if (action) {
+    state.layout.activityZones.push({ row, colStart: 1, colEnd: iconW, action });
+  }
+
+  let style = active ? colors.title : colors.dim;
+  if (focused && active) style = colors.active + colors.title;
+  const cell = centerCell(icon, iconW);
+  return style + cell + ansi.reset + colors.border + (boundaryChar || BOX.V) + ansi.reset;
+}
+
+function centerCell(text, width) {
+  text = truncateAnsi(String(text || ''), width);
+  const left = Math.floor(Math.max(0, width - stringWidth(text)) / 2);
+  return ' '.repeat(left) + padRight(text, width - left);
+}
+
 function renderTitle(width) {
   const zones = [];
-  let col = 1;
+  const startCol = state.layout.contentCol || 1;
+  let col = startCol;
+  let used = 0;
   let line = '';
 
-  const explorerLabel = state.treeCollapsed ? ' [+ Files] ' : ' [- Files] ';
-  zones.push({ row: 1, colStart: col, colEnd: col + explorerLabel.length - 1, action: 'toggle-tree' });
-  line += colors.title + explorerLabel + ansi.reset;
-  col += explorerLabel.length;
+  for (const item of getToolbarItems()) {
+    if (item.type === 'separator') {
+      if (used + 1 > width) break;
+      state.layout.titleDividerOffsets.push(used);
+      line += colors.border + BOX.V + ansi.reset;
+      used += 1;
+      col += 1;
+      continue;
+    }
 
-  const editorLabel = state.editorCollapsed ? ' [+ Editor] ' : ' [- Editor] ';
-  zones.push({ row: 1, colStart: col, colEnd: col + editorLabel.length - 1, action: 'toggle-editor' });
-  line += colors.title + editorLabel + ansi.reset;
+    const buttonW = 3;
+    if (used + buttonW > width) break;
+    if (item.enabled) {
+      zones.push({ row: 1, colStart: col, colEnd: col + buttonW - 1, action: item.action });
+    }
+    line += renderToolbarButton(item, buttonW);
+    used += buttonW;
+    col += buttonW;
+  }
 
   state.layout.titleZones = zones;
   return fit(line, width);
 }
 
-function renderPanelHeaders(layout) {
-  let line = '';
-  if (layout.hasTree) line += ' '.repeat(layout.treeW);
-  if (layout.dividerVisible) line += colors.border + '\u2502' + ansi.reset;
-  if (layout.hasEditor) line += ' '.repeat(layout.editorW);
-  return line;
+function getToolbarItems() {
+  const hasOpen = !!state.openPath;
+  const hasSel = hasSelection();
+  const writable = hasOpen && !state.readonly;
+  return [
+    { action: 'new_file', icon: 'new-file', enabled: !!state.root },
+    { action: 'open_folder', icon: 'folder-opened', enabled: true },
+    { action: 'refresh', icon: 'refresh', enabled: !!state.root },
+    { type: 'separator' },
+    { action: 'save', icon: 'save', enabled: writable && state.dirty, accent: state.dirty ? 'dirty' : '' },
+    { action: 'close_file', icon: 'close', enabled: hasOpen },
+    { type: 'separator' },
+    { action: 'undo', icon: 'discard', enabled: canUndo() },
+    { action: 'redo', icon: 'redo', enabled: canRedo() },
+    { type: 'separator' },
+    { action: 'cut', icon: 'remove', enabled: hasSel && !state.readonly },
+    { action: 'copy', icon: 'copy', enabled: hasSel },
+    { action: 'paste', icon: 'clippy', enabled: writable },
+    { type: 'separator' },
+    { action: 'find', icon: 'search', enabled: hasOpen },
+    { action: 'goto_line', icon: 'go-to-file', enabled: hasOpen },
+    { action: 'toggle_comment', icon: 'comment', enabled: writable },
+  ];
+}
+
+function renderToolbarButton(item, width) {
+  const style = item.enabled
+    ? (item.accent === 'dirty' ? colors.dirty : colors.title)
+    : colors.dim;
+  return style + centerCell(codicon(item.icon), width) + ansi.reset;
 }
 
 function renderSeparator(layout) {
-  let line = colors.border;
-  if (layout.hasTree) line += '\u2500'.repeat(layout.treeW);
-  if (layout.dividerVisible) line += '\u253c';
-  if (layout.hasEditor) line += '\u2500'.repeat(layout.editorW);
-  return line + ansi.reset;
+  return colors.border + buildContentSeparator(
+    panelWidth(layout),
+    state.layout.titleDividerOffsets,
+    panelDividerOffsets(layout)
+  ) + ansi.reset;
+}
+
+function panelWidth(layout) {
+  return (layout.hasTree ? layout.treeW : 0) +
+    (layout.dividerVisible ? 1 : 0) +
+    (layout.hasEditor ? layout.editorW : 0);
+}
+
+function panelDividerOffsets(layout) {
+  if (!layout.dividerVisible) return [];
+  return [layout.treeW];
+}
+
+function buildContentSeparator(width, aboveOffsets, belowOffsets) {
+  const chars = new Array(Math.max(0, width)).fill(BOX.H);
+  const above = new Set((aboveOffsets || []).filter(offset => offset >= 0 && offset < width));
+  const below = new Set((belowOffsets || []).filter(offset => offset >= 0 && offset < width));
+
+  for (const offset of above) {
+    chars[offset] = below.has(offset) ? BOX.CROSS : BOX.T_UP;
+  }
+  for (const offset of below) {
+    if (!above.has(offset)) chars[offset] = BOX.T_DOWN;
+  }
+
+  return chars.join('');
 }
 
 function renderBottomSeparator(layout) {
@@ -174,7 +321,7 @@ function renderBottomSeparator(layout) {
   const maxScrollX = getMaxEditorScrollX(contentW);
   let line = colors.border;
   if (layout.hasTree) line += labelOnRule(layout.treeW, leftPct >= 0 ? leftPct + '%' : '');
-  if (layout.dividerVisible) line += '\u253c';
+  if (layout.dividerVisible) line += BOX.T_UP;
   if (layout.hasEditor) {
     if (state.openPath && maxScrollX > 0 && useSixelScrollbars()) {
       line += ' '.repeat(layout.editorW);
@@ -188,19 +335,19 @@ function renderBottomSeparator(layout) {
 }
 
 function labelOnRule(width, label) {
-  if (!label || width < label.length + 4) return '\u2500'.repeat(width);
+  if (!label || width < label.length + 4) return BOX.H.repeat(width);
   const text = ' ' + label + ' ';
-  return '\u2500'.repeat(width - text.length) + text;
+  return BOX.H.repeat(width - text.length) + text;
 }
 
 function renderHorizontalScrollbar(width, viewportW, offset, maxScroll) {
   if (width <= 0) return '';
-  if (maxScroll <= 0) return '\u2500'.repeat(width);
+  if (maxScroll <= 0) return BOX.H.repeat(width);
   const handleW = Math.max(1, Math.floor(width * viewportW / (viewportW + maxScroll)));
   const handleX = Math.floor((width - handleW) * clamp(offset, 0, maxScroll) / maxScroll);
-  const before = '\u2500'.repeat(handleX);
+  const before = BOX.H.repeat(handleX);
   const handle = '\u2501'.repeat(handleW);
-  const after = '\u2500'.repeat(Math.max(0, width - handleX - handleW));
+  const after = BOX.H.repeat(Math.max(0, width - handleX - handleW));
   return colors.border + before + colors.title + handle + colors.border + after;
 }
 

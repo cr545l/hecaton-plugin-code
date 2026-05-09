@@ -476,10 +476,10 @@ async function handleMouseData(data) {
     if (isHorizontalWheel) return true;
 
     const delta = wheelStep;
-    if (!state.treeCollapsed && cx <= state.layout.treeW) {
+    if (isTreeCell(cx)) {
       state.focus = 'tree';
       state.treeCursor = Math.max(0, Math.min(Math.max(0, state.treeEntries.length - 1), state.treeCursor + delta));
-    } else if (!state.editorCollapsed && cx >= state.layout.editorCol) {
+    } else if (isEditorColumn(cx)) {
       state.focus = 'editor';
       if (state.openPath) {
         state.scrollFreed = true;
@@ -504,11 +504,18 @@ async function handleMouseData(data) {
   }
 
   if (btn === 0) {
+    if (!motion) {
+      const activityZone = findActivityZone(cx, cy);
+      if (activityZone) {
+        await handleToolbarAction(activityZone.action);
+        return true;
+      }
+    }
+
     if (!motion && cy === 1) {
       const zone = findTitleZone(cx);
       if (zone) {
-        if (zone.action === 'toggle-tree') toggleTreePanel();
-        if (zone.action === 'toggle-editor') toggleEditorPanel();
+        await handleToolbarAction(zone.action);
         return true;
       }
     }
@@ -540,13 +547,13 @@ async function handleMouseData(data) {
         state.dragging = 'editor-scrollbar';
         setScrollFromMouse(state.dragging, cx, cy);
         render();
-      } else if (cx <= state.layout.treeW) {
+      } else if (isTreeCell(cx)) {
         await clickTree(cy);
-      } else if (cx > state.layout.dividerCol) {
+      } else if (isEditorColumn(cx)) {
         clickEditor(cx, cy);
       }
     } else if (cy === 2) {
-      state.focus = cx <= state.layout.treeW ? 'tree' : 'editor';
+      state.focus = isTreeCell(cx) ? 'tree' : 'editor';
       render();
     }
     return true;
@@ -571,6 +578,7 @@ function cursorForCell(col, row) {
   if (state.dragging === 'tree-scrollbar' || state.dragging === 'editor-scrollbar') return 'ns-resize';
   if (state.dragging === 'editor-hscrollbar') return 'ew-resize';
 
+  if (findActivityZone(col, row)) return 'pointer';
   if (row === 1 && findTitleZone(col)) return 'pointer';
 
   if (state.layout.dividerVisible && col === state.layout.dividerCol &&
@@ -582,14 +590,13 @@ function cursorForCell(col, row) {
   if (inBody) {
     if (!state.treeCollapsed && col === state.layout.treeScrollCol) return 'ns-resize';
     if (!state.editorCollapsed && col === state.layout.editorScrollCol) return 'ns-resize';
-    if (!state.treeCollapsed && col <= state.layout.treeW) return 'pointer';
+    if (isTreeCell(col)) return 'pointer';
     if (!state.editorCollapsed && col >= state.layout.editorCol && col < state.layout.editorScrollCol) {
       return state.openPath ? 'text' : 'default';
     }
   }
 
   if (isEditorHScrollCell(col, row)) return 'ew-resize';
-  if (row === 2) return 'pointer';
   return 'default';
 }
 
@@ -602,13 +609,32 @@ function findTitleZone(cx) {
   return zones.find(z => cx >= z.colStart && cx <= z.colEnd) || null;
 }
 
+function findActivityZone(cx, cy) {
+  const zones = state.layout.activityZones || [];
+  return zones.find(z => cy === z.row && cx >= z.colStart && cx <= z.colEnd) || null;
+}
+
+async function handleToolbarAction(action) {
+  if (action === 'toggle-tree') {
+    toggleTreePanel();
+    return;
+  }
+  if (action === 'toggle-editor') {
+    toggleEditorPanel();
+    return;
+  }
+  await handleContextMenuAction(action);
+}
+
 function setDividerFromMouse(cx) {
   const cols = Math.max(40, state.termCols || 80);
-  const minTree = Math.min(18, Math.max(8, cols - 24));
-  const minEditor = Math.min(24, Math.max(12, cols - minTree - 1));
-  const maxTree = Math.max(minTree, cols - minEditor - 1);
-  const treeW = Math.max(minTree, Math.min(maxTree, cx - 1));
-  state.dividerRatio = treeW / cols;
+  const activityW = state.layout.activityW || 0;
+  const contentCols = Math.max(1, cols - activityW);
+  const minTree = Math.min(18, Math.max(8, contentCols - 24));
+  const minEditor = Math.min(24, Math.max(12, contentCols - minTree - 1));
+  const maxTree = Math.max(minTree, contentCols - minEditor - 1);
+  const treeW = Math.max(minTree, Math.min(maxTree, cx - activityW - 1));
+  state.dividerRatio = treeW / contentCols;
   state.treeCollapsed = false;
   state.editorCollapsed = false;
 }
@@ -634,6 +660,18 @@ function isEditorCell(cx, cy) {
     cy < state.layout.bodyTop + state.layout.bodyH &&
     cx >= state.layout.editorCol &&
     cx < state.layout.editorScrollCol;
+}
+
+function isTreeCell(cx) {
+  return !state.treeCollapsed &&
+    cx >= state.layout.treeCol &&
+    cx <= state.layout.treeScrollCol;
+}
+
+function isEditorColumn(cx) {
+  return !state.editorCollapsed &&
+    cx >= state.layout.editorCol &&
+    cx <= state.layout.editorScrollCol;
 }
 
 function isEditorHScrollCell(cx, cy) {
@@ -847,7 +885,7 @@ async function promptNewFolder() {
 }
 
 function handleContextMenuRequest(col, row) {
-  if (!state.treeCollapsed && row >= state.layout.bodyTop && row < state.layout.bodyTop + state.layout.bodyH && col <= state.layout.treeW) {
+  if (!state.treeCollapsed && row >= state.layout.bodyTop && row < state.layout.bodyTop + state.layout.bodyH && isTreeCell(col)) {
     const idx = state.treeScroll + (row - state.layout.bodyTop);
     if (idx >= 0 && idx < state.treeEntries.length) state.treeCursor = idx;
     state.focus = 'tree';
@@ -855,7 +893,7 @@ function handleContextMenuRequest(col, row) {
     render();
     return;
   }
-  if (!state.editorCollapsed && col >= state.layout.editorCol) {
+  if (isEditorColumn(col)) {
     state.focus = 'editor';
     hecaton.menu.show({ items: getEditorMenuItems() }).catch(() => null);
     render();
