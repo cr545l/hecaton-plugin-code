@@ -4,6 +4,7 @@ function stripAnsi(str) {
 
 function charWidth(ch) {
   const code = ch.codePointAt(0);
+  if (code === 0x09) return 1;
   if (code <= 0x1F || code === 0x7F) return 0;
   if (
     (code >= 0x1100 && code <= 0x115F) ||

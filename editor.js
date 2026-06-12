@@ -1,6 +1,6 @@
 const { state, setStatus } = require('./state');
 const { baseName, readTextFile, writeTextFile } = require('./fs-ops');
-const { wordLeft, wordRight } = require('./text');
+const { wordLeft, wordRight, wordBoundsAt } = require('./text');
 const {
   emptySelection,
   cloneSelection,
@@ -39,6 +39,7 @@ function setLinesFromContent(content) {
   state.lineEnding = detectLineEnding(content);
   const text = normalizeContent(content);
   state.editLines = text.length ? text.split('\n') : [''];
+  state.docVersion++;
 }
 
 function contentFromLines(opts) {
@@ -345,6 +346,7 @@ function resetHistory() {
 }
 
 function markDirty() {
+  state.docVersion++;
   state.dirty = normalizedContentFromLines() !== state.originalContent;
 }
 
@@ -532,6 +534,42 @@ function insertText(text, type) {
   text = normalizeContent(text);
   if (!text) return false;
   return replaceSelections(text, type || 'insert');
+}
+
+const BLOCK_PAIRS = { '(': ')', '[': ']', '{': '}' };
+
+function insertNewline() {
+  if (state.readonly || !state.openPath) return false;
+  const selections = ensureSelections(state);
+  const unit = indentUnit();
+  const edits = selections.map(sel => {
+    const range = selectionRange(sel);
+    const before = (state.editLines[range.startRow] || '').substring(0, range.startCol);
+    const after = (state.editLines[range.endRow] || '').substring(range.endCol);
+    const baseIndent = (before.match(/^[ \t]*/) || [''])[0];
+    const trimmed = before.replace(/[ \t]+$/, '');
+    const lastCh = trimmed.charAt(trimmed.length - 1);
+    const opensBlock = Object.prototype.hasOwnProperty.call(BLOCK_PAIRS, lastCh);
+    let text = '\n' + baseIndent;
+    if (opensBlock) {
+      text = '\n' + baseIndent + unit;
+      if (after.charAt(0) === BLOCK_PAIRS[lastCh]) {
+        return { range, text: text + '\n' + baseIndent, afterOffset: text.length };
+      }
+    }
+    return { range, text, afterOffset: text.length };
+  });
+
+  if (selections.length === 1) {
+    const e = edits[0];
+    const afterCursor = rangeEndForText(e.range.startRow, e.range.startCol, e.text.substring(0, e.afterOffset));
+    return replaceRange(e.range, e.text, 'newline', afterCursor);
+  }
+  return commitSnapshotEdit('newline', 'newline', () => {
+    const positions = replaceRangesRaw(edits);
+    setSelections(state, positions.map(pos => emptySelection(pos.row, pos.col)));
+    return true;
+  });
 }
 
 function previousCharIndex(line, col) {
@@ -870,7 +908,39 @@ function addCursorVertical(delta) {
 }
 
 function indentUnit() {
+  if (state.indentWithTabs) return '\t';
   return ' '.repeat(Math.max(1, state.tabSize || DEFAULT_TAB_SIZE));
+}
+
+function detectIndentation(content) {
+  const lines = normalizeContent(content).split('\n');
+  let tabLines = 0;
+  const widthCounts = new Map();
+  let prevIndent = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (line[0] === '\t') {
+      tabLines++;
+      continue;
+    }
+    const m = line.match(/^ +/);
+    const indent = m ? m[0].length : 0;
+    const delta = indent - prevIndent;
+    if (delta >= 2 && delta <= 8) widthCounts.set(delta, (widthCounts.get(delta) || 0) + 1);
+    prevIndent = indent;
+  }
+  let bestWidth = 0;
+  let bestCount = 0;
+  for (const [width, count] of widthCounts) {
+    if (count > bestCount) {
+      bestWidth = width;
+      bestCount = count;
+    }
+  }
+  return {
+    tabs: tabLines > bestCount,
+    size: bestWidth || DEFAULT_TAB_SIZE,
+  };
 }
 
 function adjustPositionColumn(pos, row, delta) {
@@ -1162,6 +1232,140 @@ function selectFoundMatch(query, row, col) {
   return true;
 }
 
+function selectNextOccurrence() {
+  if (!state.openPath) return false;
+  state.scrollFreed = false;
+  const selections = ensureSelections(state);
+  const last = selections[selections.length - 1];
+
+  if (selectionIsEmpty(last)) {
+    const line = state.editLines[last.row] || '';
+    if (!line.trim()) return false;
+    const wb = wordBoundsAt(line, Math.min(last.col, Math.max(0, line.length - 1)));
+    if (wb.start === wb.end) return false;
+    setSelections(state, selections.slice(0, -1).concat([{
+      anchorRow: last.row,
+      anchorCol: wb.start,
+      row: last.row,
+      col: wb.end,
+    }]));
+    return true;
+  }
+
+  const lastRange = selectionRange(last);
+  if (lastRange.startRow !== lastRange.endRow) return false;
+  const query = textFromRange(lastRange);
+  if (!query) return false;
+
+  const matches = [];
+  for (let row = 0; row < state.editLines.length; row++) {
+    const line = state.editLines[row];
+    let idx = 0;
+    while ((idx = line.indexOf(query, idx)) >= 0) {
+      matches.push({ row, start: idx, end: idx + query.length });
+      idx += Math.max(1, query.length);
+    }
+  }
+
+  const selectedKeys = new Set(getSelectionRanges()
+    .filter(r => r.startRow === r.endRow)
+    .map(r => r.startRow + ':' + r.startCol + ':' + r.endCol));
+  const isAfterLast = m => m.row > lastRange.endRow ||
+    (m.row === lastRange.endRow && m.start >= lastRange.endCol);
+  const ordered = matches.filter(isAfterLast).concat(matches.filter(m => !isAfterLast(m)));
+
+  for (const m of ordered) {
+    if (selectedKeys.has(m.row + ':' + m.start + ':' + m.end)) continue;
+    setSelections(state, selections.concat([{
+      anchorRow: m.row,
+      anchorCol: m.start,
+      row: m.row,
+      col: m.end,
+    }]));
+    setStatus(state.selections.length + ' selections', 'info', 1400);
+    return true;
+  }
+  setStatus('All occurrences selected', 'info', 1600);
+  return false;
+}
+
+function selectLine() {
+  if (!state.openPath) return false;
+  state.scrollFreed = false;
+  const sel = ensureSelections(state)[0];
+  const r = selectionRange(sel);
+  const lastRow = state.editLines.length - 1;
+  const empty = selectionIsEmpty(sel);
+  const startRow = empty ? sel.row : r.startRow;
+
+  let lastTouched;
+  if (empty) lastTouched = sel.row;
+  else if (r.endCol === 0 && r.endRow > r.startRow) {
+    lastTouched = r.startCol === 0 ? r.endRow : r.endRow - 1;
+  } else {
+    lastTouched = r.endRow;
+  }
+
+  let row, col;
+  if (lastTouched >= lastRow) {
+    row = lastRow;
+    col = state.editLines[lastRow].length;
+  } else {
+    row = lastTouched + 1;
+    col = 0;
+  }
+  setSelections(state, [{ anchorRow: startRow, anchorCol: 0, row, col }]);
+  return true;
+}
+
+function matchesFindQuery(text, query) {
+  if (state.findCaseSensitive) return text === query;
+  return text.toLowerCase() === query.toLowerCase();
+}
+
+function replaceNext(query, replacement) {
+  if (!state.openPath || state.readonly) return false;
+  if (query != null) state.findQuery = String(query);
+  const q = state.findQuery;
+  if (!q) return false;
+  const sel = getSelectionRange();
+  if (sel && matchesFindQuery(textFromRange(sel), q)) {
+    replaceRange(sel, replacement, 'replace');
+  }
+  return findNext(q, false);
+}
+
+function replaceAllMatches(query, replacement) {
+  if (!state.openPath || state.readonly) return 0;
+  query = String(query || '');
+  replacement = normalizeContent(replacement || '');
+  if (!query) return 0;
+  let count = 0;
+  const ok = commitSnapshotEdit('replace-all', 'replace all', () => {
+    const q = state.findCaseSensitive ? query : query.toLowerCase();
+    for (let row = 0; row < state.editLines.length; row++) {
+      const line = state.editLines[row];
+      const hay = state.findCaseSensitive ? line : line.toLowerCase();
+      if (hay.indexOf(q) < 0) continue;
+      let out = '';
+      let i = 0;
+      let idx;
+      while ((idx = hay.indexOf(q, i)) >= 0) {
+        out += line.substring(i, idx) + replacement;
+        i = idx + query.length;
+        count++;
+      }
+      out += line.substring(i);
+      state.editLines[row] = out;
+    }
+    if (count > 0 && replacement.indexOf('\n') >= 0) {
+      state.editLines = state.editLines.join('\n').split('\n');
+    }
+    return count > 0;
+  });
+  return ok ? count : 0;
+}
+
 function gotoLine(lineNumber) {
   if (!state.openPath) return false;
   const row = Math.max(0, Math.min(Number(lineNumber || 1) - 1, state.editLines.length - 1));
@@ -1173,6 +1377,68 @@ function gotoLine(lineNumber) {
 function currentLineText() {
   if (!state.openPath) return '';
   return (state.editLines[state.cursorRow] || '') + '\n';
+}
+
+const BRACKET_CLOSE_TO_OPEN = { ')': '(', ']': '[', '}': '{' };
+const BRACKET_SCAN_BUDGET = 200000;
+
+function findBracketMatch() {
+  if (!state.openPath) return null;
+  const sel = ensureSelections(state)[0];
+  if (!sel || !selectionIsEmpty(sel)) return null;
+  const line = state.editLines[sel.row] || '';
+  let col = -1;
+  let ch = '';
+  for (const c of [sel.col, sel.col - 1]) {
+    const candidate = c >= 0 ? line[c] : '';
+    if (candidate && (BLOCK_PAIRS[candidate] || BRACKET_CLOSE_TO_OPEN[candidate])) {
+      col = c;
+      ch = candidate;
+      break;
+    }
+  }
+  if (col < 0) return null;
+  const partner = BLOCK_PAIRS[ch]
+    ? scanBracketForward(sel.row, col, ch, BLOCK_PAIRS[ch])
+    : scanBracketBackward(sel.row, col, BRACKET_CLOSE_TO_OPEN[ch], ch);
+  if (!partner) return null;
+  return [{ row: sel.row, col }, partner];
+}
+
+function scanBracketForward(row, col, open, close) {
+  let depth = 0;
+  let budget = BRACKET_SCAN_BUDGET;
+  for (let r = row; r < state.editLines.length; r++) {
+    const line = state.editLines[r] || '';
+    for (let c = r === row ? col : 0; c < line.length; c++) {
+      if (--budget < 0) return null;
+      const ch = line[c];
+      if (ch === open) depth++;
+      else if (ch === close) {
+        depth--;
+        if (depth === 0) return { row: r, col: c };
+      }
+    }
+  }
+  return null;
+}
+
+function scanBracketBackward(row, col, open, close) {
+  let depth = 0;
+  let budget = BRACKET_SCAN_BUDGET;
+  for (let r = row; r >= 0; r--) {
+    const line = state.editLines[r] || '';
+    for (let c = r === row ? col : line.length - 1; c >= 0; c--) {
+      if (--budget < 0) return null;
+      const ch = line[c];
+      if (ch === close) depth++;
+      else if (ch === open) {
+        depth--;
+        if (depth === 0) return { row: r, col: c };
+      }
+    }
+  }
+  return null;
 }
 
 async function openFile(filePath, opts) {
@@ -1200,6 +1466,7 @@ async function openFile(filePath, opts) {
     state.originalContent = '';
     state.lineEnding = '\n';
     state.editLines = [result.error || 'Cannot open file'];
+    state.docVersion++;
     state.cursorRow = 0;
     state.cursorCol = 0;
     state.scrollY = 0;
@@ -1221,6 +1488,9 @@ async function openFile(filePath, opts) {
   state.openName = baseName(filePath);
   state.originalContent = normalizeContent(result.content);
   setLinesFromContent(result.content);
+  const indent = detectIndentation(result.content);
+  state.tabSize = indent.size;
+  state.indentWithTabs = indent.tabs;
   state.cursorRow = 0;
   state.cursorCol = 0;
   state.desiredCol = null;
@@ -1259,6 +1529,36 @@ async function saveFile() {
   return true;
 }
 
+async function saveFileAs(targetPath) {
+  if (!state.openPath || state.readonly || !targetPath) return false;
+  const content = contentFromLines({ native: true });
+  const result = await writeTextFile(targetPath, content);
+  if (!result.ok) {
+    setStatus(result.error || 'Save failed', 'error', 4000);
+    return false;
+  }
+  state.openPath = targetPath;
+  state.openName = baseName(targetPath);
+  state.originalContent = normalizedContentFromLines();
+  state.dirty = false;
+  state.fileMtimeMs = result.mtime || Date.now();
+  state.fileSizeBytes = result.size || content.length;
+  state.lastSavedAt = Date.now();
+  resetEditCoalescing();
+  setStatus('Saved as ' + state.openName, 'success', 2200);
+  return true;
+}
+
+function remapOpenPath(oldPath, newPath) {
+  if (!state.openPath) return;
+  if (state.openPath === oldPath) {
+    state.openPath = newPath;
+    state.openName = baseName(newPath);
+  } else if (state.openPath.startsWith(oldPath + '/')) {
+    state.openPath = newPath + state.openPath.substring(oldPath.length);
+  }
+}
+
 async function closeFile(force) {
   if (state.dirty && !force) {
     state.pendingDialog = { type: 'dirty-close' };
@@ -1279,6 +1579,7 @@ async function closeFile(force) {
   state.originalContent = '';
   state.lineEnding = '\n';
   state.editLines = [''];
+  state.docVersion++;
   state.cursorRow = 0;
   state.cursorCol = 0;
   state.scrollY = 0;
@@ -1288,6 +1589,8 @@ async function closeFile(force) {
   state.readonly = false;
   state.binary = false;
   state.findQuery = '';
+  state.tabSize = DEFAULT_TAB_SIZE;
+  state.indentWithTabs = false;
   resetHistory();
   syncSelectionsFromLegacy(state);
   clearSelection();
@@ -1316,6 +1619,8 @@ module.exports = {
   undo,
   redo,
   insertText,
+  insertNewline,
+  indentUnit,
   tryInsertPair,
   trySkipClosingPair,
   tryDeletePairBackward,
@@ -1340,12 +1645,19 @@ module.exports = {
   moveDocumentStart,
   moveDocumentEnd,
   selectAll,
+  selectLine,
+  selectNextOccurrence,
   addCursor,
   addCursorVertical,
   findNext,
+  replaceNext,
+  replaceAllMatches,
   gotoLine,
   countFindMatches,
+  findBracketMatch,
   openFile,
   saveFile,
+  saveFileAs,
+  remapOpenPath,
   closeFile,
 };

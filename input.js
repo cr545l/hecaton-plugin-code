@@ -12,9 +12,15 @@ const {
   setRoot,
   createFile,
   createFolder,
+  renamePath,
+  copyPath,
+  deletePath,
+  uniqueCopyPath,
 } = require('./fs-ops');
 const {
   insertText,
+  insertNewline,
+  indentUnit,
   deleteBackward,
   deleteForward,
   deleteWordBackward,
@@ -36,6 +42,8 @@ const {
   moveDocumentStart,
   moveDocumentEnd,
   selectAll,
+  selectLine,
+  selectNextOccurrence,
   addCursor,
   addCursorVertical,
   hasSelection,
@@ -46,6 +54,8 @@ const {
   trySkipClosingPair,
   tryDeletePairBackward,
   findNext,
+  replaceNext,
+  replaceAllMatches,
   gotoLine,
   canUndo,
   canRedo,
@@ -53,10 +63,13 @@ const {
   redo,
   openFile,
   saveFile,
+  saveFileAs,
+  remapOpenPath,
   closeFile,
 } = require('./editor');
 const { render } = require('./render');
 const { screenColToCharIdx, stringWidth, wordBoundsAt } = require('./text');
+const { visualRowCount, segmentAt, maxLineDisplayWidth } = require('./wrap');
 const { syncSelectionsFromLegacy } = require('./cursor-state');
 
 let currentMouseShape = 'default';
@@ -259,6 +272,15 @@ function toggleEditorPanel() {
   render();
 }
 
+function toggleWordWrap() {
+  state.wordWrap = !state.wordWrap;
+  state.scrollX = 0;
+  state.scrollY = 0;
+  state.scrollFreed = false;
+  setStatus(state.wordWrap ? 'Word wrap on' : 'Word wrap off', 'info', 1600);
+  render();
+}
+
 function focusNextPanel() {
   if (!state.treeCollapsed && !state.editorCollapsed) {
     state.focus = state.focus === 'tree' ? 'editor' : 'tree';
@@ -301,6 +323,9 @@ async function handleTreeKey(key) {
   }
   if (key === 'o' || key === 'O') { await chooseFolder(); return; }
   if (key === 'n' || key === 'N') { await promptNewFile(); return; }
+  if (key === 'd' || key === 'D') { await duplicateEntry(); return; }
+  if (key === ESC + 'OQ' || key === CSI + '12~') { await promptRename(); return; }
+  if (key === CSI + '3~') { await promptDelete(); return; }
 }
 
 async function handleEditorKey(key) {
@@ -310,11 +335,15 @@ async function handleEditorKey(key) {
     return;
   }
   if (key === '\x13') { await saveFile(); render(); return; }
+  if (key === CSI + '83;6u' || key === CSI + '115;6u') { await promptSaveAs(); return; }
   if (key === '\x17') { await closeFile(false); render(); return; }
   if (key === '\x0f') { await chooseFolder(); return; }
   if (key === '\x06') { await promptFind(); return; }
+  if (key === '\x12' || key === CSI + '104;5u' || key === CSI + '72;5u') { await promptReplace(); return; }
   if (key === '\x07') { await promptGotoLine(); return; }
   if (key === '\x01') { selectAll(); render(); return; }
+  if (key === '\x04') { selectNextOccurrence(); render(); return; }
+  if (key === '\x0c') { selectLine(); render(); return; }
   if (key === '\x03') { copySelection(false); render(); return; }
   if (key === '\x18') { copySelection(true); render(); return; }
   if (key === '\x16') { await pasteFromClipboard(); return; }
@@ -323,6 +352,7 @@ async function handleEditorKey(key) {
   if (key === '\x15') { deleteToLineStart(); render(); return; }
   if (key === '\x0b') { deleteToLineEnd(); render(); return; }
   if (key === '\x1f') { toggleLineComment(); render(); return; }
+  if (key === ESC + 'z' || key === ESC + 'Z') { toggleWordWrap(); return; }
 
   if (key === CSI + 'A') { moveVertical(-1, false); render(); return; }
   if (key === CSI + 'B') { moveVertical(1, false); render(); return; }
@@ -362,7 +392,7 @@ async function handleEditorKey(key) {
     render();
     return;
   }
-  if (key === '\r' || key === '\n') { insertText('\n', 'newline'); render(); return; }
+  if (key === '\r' || key === '\n') { insertNewline(); render(); return; }
   if (key === CSI + 'Z') {
     if (state.openPath) outdentLines();
     else if (!state.treeCollapsed) state.focus = 'tree';
@@ -371,7 +401,7 @@ async function handleEditorKey(key) {
   }
   if (key === '\t') {
     if (hasSelection()) indentLines();
-    else insertText('  ', 'insert');
+    else insertText(indentUnit(), 'insert');
     render();
     return;
   }
@@ -671,6 +701,7 @@ function setDividerFromMouse(cx) {
 }
 
 function getMaxEditorScroll() {
+  if (state.wordWrap && state.openPath) return Math.max(0, visualRowCount() - state.layout.bodyH);
   return Math.max(0, state.editLines.length - state.layout.bodyH);
 }
 
@@ -679,10 +710,8 @@ function getEditorContentWidth() {
 }
 
 function getMaxEditorScrollX() {
-  const contentW = getEditorContentWidth();
-  let maxLineW = 0;
-  for (const line of state.editLines) maxLineW = Math.max(maxLineW, stringWidth(line));
-  return Math.max(0, maxLineW - contentW);
+  if (state.wordWrap) return 0;
+  return Math.max(0, maxLineDisplayWidth() - getEditorContentWidth());
 }
 
 function isEditorCell(cx, cy) {
@@ -726,7 +755,7 @@ function setScrollFromMouse(target, cx, cy) {
     return;
   }
   if (target === 'editor-scrollbar') {
-    const maxScroll = Math.max(0, state.editLines.length - state.layout.bodyH);
+    const maxScroll = getMaxEditorScroll();
     if (maxScroll <= 0) return;
     state.scrollY = Math.round((row / denom) * maxScroll);
     state.scrollFreed = true;
@@ -803,10 +832,21 @@ function clickEditor(cx, cy, addCursorMode) {
 
 function editorPositionFromMouse(cx, cy) {
   if (!state.openPath) return { row: 0, col: 0 };
-  const row = state.scrollY + (cy - state.layout.bodyTop);
-  const clampedRow = Math.max(0, Math.min(row, state.editLines.length - 1));
   const contentStart = state.layout.editorCol + state.layout.gutterW + 2;
   const screenCol = Math.max(0, Math.min(cx, state.layout.editorScrollCol - 1) - contentStart);
+
+  if (state.wordWrap) {
+    const seg = segmentAt(state.scrollY + (cy - state.layout.bodyTop));
+    const line = state.editLines[seg.row] || '';
+    const within = screenColToCharIdx(line.substring(seg.startCol, seg.endCol), screenCol);
+    return {
+      row: seg.row,
+      col: Math.max(0, Math.min(seg.startCol + within, line.length)),
+    };
+  }
+
+  const row = state.scrollY + (cy - state.layout.bodyTop);
+  const clampedRow = Math.max(0, Math.min(row, state.editLines.length - 1));
   const actualCol = state.scrollX + screenCol;
   const col = screenColToCharIdx(state.editLines[clampedRow] || '', actualCol);
   return {
@@ -925,6 +965,167 @@ async function promptNewFolder() {
   }).catch(() => { state.pendingDialog = null; });
 }
 
+async function promptSaveAs() {
+  if (!state.openPath || state.readonly) return;
+  if (hecaton.picker && typeof hecaton.picker.save === 'function') {
+    const picked = await hecaton.picker.save({
+      default_path: dirName(state.openPath),
+      default_name: state.openName,
+    }).catch(() => null);
+    if (picked && picked.path) await performSaveAs(resolvePath(picked.path, state.root), true);
+    else render();
+    return;
+  }
+  state.pendingDialog = { type: 'save-as', targetDir: dirName(state.openPath) };
+  await hecaton.dialog.show({
+    type: 'input',
+    title: 'Save As',
+    message: 'Save as:',
+    defaultValue: state.openName,
+    buttons: [
+      { id: 'save_as', label: 'Save', default: true },
+      { id: 'cancel', label: 'Cancel' },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
+}
+
+async function performSaveAs(target, overwriteConfirmed) {
+  if (!target || !state.openPath) {
+    render();
+    return;
+  }
+  if (target === state.openPath) {
+    await saveFile();
+    render();
+    return;
+  }
+  const st = await statPath(target);
+  if (st && st.is_dir) {
+    setStatus('Path is a folder: ' + target, 'error', 4000);
+    render();
+    return;
+  }
+  if (st && !overwriteConfirmed) {
+    state.pendingDialog = { type: 'save-as-overwrite', targetPath: target };
+    await hecaton.dialog.show({
+      type: 'message',
+      title: 'Overwrite File',
+      message: '"' + baseName(target) + '" already exists. Overwrite?',
+      buttons: [
+        { id: 'overwrite', label: 'Overwrite' },
+        { id: 'cancel', label: 'Cancel', default: true },
+      ],
+    }).catch(() => { state.pendingDialog = null; });
+    return;
+  }
+  const ok = await saveFileAs(target);
+  if (ok) await refreshTree(target);
+  render();
+}
+
+async function promptRename() {
+  const entry = selectedEntry();
+  if (!entry) return;
+  state.pendingDialog = { type: 'rename', targetPath: entry.path };
+  await hecaton.dialog.show({
+    type: 'input',
+    title: entry.isDir ? 'Rename Folder' : 'Rename File',
+    message: 'New name:',
+    defaultValue: entry.name,
+    buttons: [
+      { id: 'rename', label: 'Rename', default: true },
+      { id: 'cancel', label: 'Cancel' },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
+}
+
+async function performRename(oldPath, value) {
+  const target = resolvePath(value, dirName(oldPath));
+  if (!target || target === oldPath) {
+    render();
+    return;
+  }
+  if (await statPath(target)) {
+    setStatus('Path already exists: ' + (baseName(target) || target), 'error', 4000);
+    render();
+    return;
+  }
+  const result = await renamePath(oldPath, target);
+  if (!result.ok) {
+    setStatus(result.error || 'Rename failed', 'error', 4000);
+    render();
+    return;
+  }
+  remapExpandedDirs(oldPath, target);
+  remapOpenPath(oldPath, target);
+  await refreshTree(target);
+  setStatus('Renamed to ' + (baseName(target) || target), 'success', 2500);
+  render();
+}
+
+function remapExpandedDirs(oldPath, newPath) {
+  const next = new Set();
+  for (const dir of state.expandedDirs) {
+    if (dir === oldPath) next.add(newPath);
+    else if (dir.startsWith(oldPath + '/')) next.add(newPath + dir.substring(oldPath.length));
+    else next.add(dir);
+  }
+  state.expandedDirs = next;
+}
+
+async function duplicateEntry() {
+  const entry = selectedEntry();
+  if (!entry) return;
+  const target = await uniqueCopyPath(entry.path, entry.isDir);
+  if (!target) {
+    setStatus('No free name for a copy of ' + entry.name, 'error', 4000);
+    render();
+    return;
+  }
+  const result = await copyPath(entry.path, target, entry.isDir);
+  if (!result.ok) {
+    setStatus(result.error || 'Duplicate failed', 'error', 4000);
+    render();
+    return;
+  }
+  await refreshTree(target);
+  setStatus('Duplicated to ' + baseName(target), 'success', 2500);
+  render();
+}
+
+async function promptDelete() {
+  const entry = selectedEntry();
+  if (!entry) return;
+  state.pendingDialog = { type: 'delete', targetPath: entry.path };
+  await hecaton.dialog.show({
+    type: 'message',
+    title: entry.isDir ? 'Delete Folder' : 'Delete File',
+    message: 'Delete "' + entry.name + '"' + (entry.isDir ? ' and all of its contents?' : '?') + ' This cannot be undone.',
+    buttons: [
+      { id: 'delete', label: 'Delete' },
+      { id: 'cancel', label: 'Cancel', default: true },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
+}
+
+async function performDelete(targetPath) {
+  const result = await deletePath(targetPath);
+  if (!result.ok) {
+    setStatus(result.error || 'Delete failed', 'error', 4000);
+    render();
+    return;
+  }
+  if (state.openPath && (state.openPath === targetPath || state.openPath.startsWith(targetPath + '/'))) {
+    await closeFile(true);
+  }
+  for (const dir of [...state.expandedDirs]) {
+    if (dir === targetPath || dir.startsWith(targetPath + '/')) state.expandedDirs.delete(dir);
+  }
+  await refreshTree();
+  setStatus('Deleted ' + (baseName(targetPath) || targetPath), 'success', 2500);
+  render();
+}
+
 function handleContextMenuRequest(col, row) {
   if (!state.treeCollapsed && row >= state.layout.bodyTop && row < state.layout.bodyTop + state.layout.bodyH && isTreeCell(col)) {
     const idx = state.treeScroll + (row - state.layout.bodyTop);
@@ -947,6 +1148,10 @@ function getTreeMenuItems() {
   if (entry) {
     items.push({ id: 'open', label: entry.isDir ? 'Expand/Collapse' : 'Open', icon: entry.isDir ? 'folder-opened' : 'file' });
     items.push({ id: 'copy_path', label: 'Copy Path', icon: 'copy' });
+    items.push({ type: 'separator' });
+    items.push({ id: 'rename_entry', label: 'Rename...', shortcut: 'F2', icon: 'edit' });
+    items.push({ id: 'duplicate_entry', label: 'Duplicate', shortcut: 'D', icon: 'files' });
+    items.push({ id: 'delete_entry', label: 'Delete...', shortcut: 'Del', icon: 'trash' });
     items.push({ type: 'separator' });
   }
   items.push(
@@ -971,19 +1176,24 @@ function getEditorMenuItems() {
     { id: 'redo', label: 'Redo', shortcut: 'Ctrl+Y', icon: 'redo', enabled: canRedo() },
     { type: 'separator' },
     { id: 'save', label: 'Save', shortcut: 'Ctrl+S', icon: 'save', enabled: hasOpen && state.dirty && !state.readonly },
+    { id: 'save_as', label: 'Save As...', shortcut: 'Ctrl+Shift+S', icon: 'save-as', enabled: hasOpen && !state.readonly },
     { id: 'close_file', label: 'Close File', shortcut: 'Ctrl+W', icon: 'close', enabled: hasOpen },
     { type: 'separator' },
     { id: 'toggle_tree_panel', label: state.treeCollapsed ? 'Show Files' : 'Hide Files', shortcut: 'Ctrl+B', icon: 'layout-sidebar-left' },
     { id: 'toggle_editor_panel', label: state.editorCollapsed ? 'Show Editor' : 'Hide Editor', icon: 'layout' },
+    { id: 'toggle_wrap', label: state.wordWrap ? 'Disable Word Wrap' : 'Enable Word Wrap', shortcut: 'Alt+Z', icon: 'word-wrap', enabled: hasOpen },
     { type: 'separator' },
     { id: 'cut', label: 'Cut', shortcut: 'Ctrl+X', icon: 'cut', enabled: hasSel && !state.readonly },
     { id: 'copy', label: 'Copy', shortcut: 'Ctrl+C', icon: 'copy', enabled: hasSel },
     { id: 'paste', label: 'Paste', shortcut: 'Ctrl+V', icon: 'paste', enabled: hasOpen && !state.readonly },
     { id: 'select_all', label: 'Select All', shortcut: 'Ctrl+A', icon: 'selection', enabled: hasOpen },
+    { id: 'select_line', label: 'Select Line', shortcut: 'Ctrl+L', icon: 'selection', enabled: hasOpen },
+    { id: 'select_next_occurrence', label: 'Select Next Occurrence', shortcut: 'Ctrl+D', icon: 'selection', enabled: hasOpen },
     { type: 'separator' },
     { id: 'find', label: 'Find...', shortcut: 'Ctrl+F', icon: 'search', enabled: hasOpen },
     { id: 'find_next', label: 'Find Next', shortcut: 'F3', icon: 'arrow-down', enabled: hasOpen && !!state.findQuery },
     { id: 'find_previous', label: 'Find Previous', shortcut: 'Shift+F3', icon: 'arrow-up', enabled: hasOpen && !!state.findQuery },
+    { id: 'replace', label: 'Replace...', shortcut: 'Ctrl+R', icon: 'replace', enabled: hasOpen && !state.readonly },
     { id: 'goto_line', label: 'Go to Line...', shortcut: 'Ctrl+G', icon: 'go-to-file', enabled: hasOpen },
     { type: 'separator' },
     { id: 'toggle_comment', label: 'Toggle Line Comment', shortcut: 'Ctrl+/', icon: 'comment', enabled: hasOpen && !state.readonly },
@@ -1019,6 +1229,15 @@ async function handleContextMenuAction(actionId) {
     case 'new_folder':
       await promptNewFolder();
       return;
+    case 'rename_entry':
+      await promptRename();
+      return;
+    case 'duplicate_entry':
+      await duplicateEntry();
+      return;
+    case 'delete_entry':
+      await promptDelete();
+      return;
     case 'open_folder':
       await chooseFolder();
       return;
@@ -1037,9 +1256,15 @@ async function handleContextMenuAction(actionId) {
     case 'toggle_editor_panel':
       toggleEditorPanel();
       return;
+    case 'toggle_wrap':
+      toggleWordWrap();
+      return;
     case 'save':
       await saveFile();
       render();
+      return;
+    case 'save_as':
+      await promptSaveAs();
       return;
     case 'close_file':
       await closeFile(false);
@@ -1060,8 +1285,19 @@ async function handleContextMenuAction(actionId) {
       selectAll();
       render();
       return;
+    case 'select_line':
+      selectLine();
+      render();
+      return;
+    case 'select_next_occurrence':
+      selectNextOccurrence();
+      render();
+      return;
     case 'find':
       await promptFind();
+      return;
+    case 'replace':
+      await promptReplace();
       return;
     case 'find_next':
       findNext(null, false);
@@ -1157,10 +1393,68 @@ async function handleDialogResult(params) {
     return;
   }
 
+  if (pending.type === 'rename') {
+    if (button === 'rename' && value.trim()) await performRename(pending.targetPath, value.trim());
+    else render();
+    return;
+  }
+
+  if (pending.type === 'delete') {
+    if (button === 'delete') await performDelete(pending.targetPath);
+    else render();
+    return;
+  }
+
+  if (pending.type === 'save-as') {
+    if (button === 'save_as' && value.trim()) await performSaveAs(resolvePath(value.trim(), pending.targetDir), false);
+    else render();
+    return;
+  }
+
+  if (pending.type === 'save-as-overwrite') {
+    if (button === 'overwrite') await performSaveAs(pending.targetPath, true);
+    else render();
+    return;
+  }
+
   if (pending.type === 'find') {
+    if (button === 'toggle_case') {
+      state.findCaseSensitive = !state.findCaseSensitive;
+      await promptFind(value);
+      return;
+    }
     if (button === 'find') {
       if (value) findNext(value, false);
       else state.findQuery = '';
+    }
+    render();
+    return;
+  }
+
+  if (pending.type === 'replace-find') {
+    if (button === 'toggle_case') {
+      state.findCaseSensitive = !state.findCaseSensitive;
+      await promptReplace(value);
+      return;
+    }
+    if (button === 'next' && value) {
+      state.findQuery = value;
+      await promptReplaceWith(value);
+      return;
+    }
+    render();
+    return;
+  }
+
+  if (pending.type === 'replace-with') {
+    state.replaceText = value;
+    if (button === 'replace') {
+      replaceNext(pending.query, value);
+    } else if (button === 'replace_all') {
+      const count = replaceAllMatches(pending.query, value);
+      setStatus(count
+        ? 'Replaced ' + count + ' occurrence' + (count === 1 ? '' : 's')
+        : 'No matches: ' + pending.query, count ? 'success' : 'error', 3000);
     }
     render();
     return;
@@ -1190,17 +1484,55 @@ async function handleDialogResult(params) {
   }
 }
 
-async function promptFind() {
+async function promptFind(seedOverride) {
   const selected = selectedText();
-  const seed = selected && selected.indexOf('\n') < 0 ? selected : state.findQuery;
+  const seed = seedOverride != null
+    ? seedOverride
+    : (selected && selected.indexOf('\n') < 0 ? selected : state.findQuery);
   state.pendingDialog = { type: 'find' };
   await hecaton.dialog.show({
     type: 'input',
-    title: 'Find',
+    title: 'Find' + (state.findCaseSensitive ? ' (case sensitive)' : ''),
     message: 'Find:',
     defaultValue: seed || '',
     buttons: [
       { id: 'find', label: 'Find', default: true },
+      { id: 'toggle_case', label: state.findCaseSensitive ? 'Aa: On' : 'Aa: Off' },
+      { id: 'cancel', label: 'Cancel' },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
+}
+
+async function promptReplace(seedOverride) {
+  if (!state.openPath || state.readonly) return;
+  const selected = selectedText();
+  const seed = seedOverride != null
+    ? seedOverride
+    : (selected && selected.indexOf('\n') < 0 ? selected : state.findQuery);
+  state.pendingDialog = { type: 'replace-find' };
+  await hecaton.dialog.show({
+    type: 'input',
+    title: 'Replace' + (state.findCaseSensitive ? ' (case sensitive)' : ''),
+    message: 'Find:',
+    defaultValue: seed || '',
+    buttons: [
+      { id: 'next', label: 'Next', default: true },
+      { id: 'toggle_case', label: state.findCaseSensitive ? 'Aa: On' : 'Aa: Off' },
+      { id: 'cancel', label: 'Cancel' },
+    ],
+  }).catch(() => { state.pendingDialog = null; });
+}
+
+async function promptReplaceWith(query) {
+  state.pendingDialog = { type: 'replace-with', query };
+  await hecaton.dialog.show({
+    type: 'input',
+    title: 'Replace',
+    message: 'Replace "' + query + '" with:',
+    defaultValue: state.replaceText || '',
+    buttons: [
+      { id: 'replace', label: 'Replace', default: true },
+      { id: 'replace_all', label: 'Replace All' },
       { id: 'cancel', label: 'Cancel' },
     ],
   }).catch(() => { state.pendingDialog = null; });

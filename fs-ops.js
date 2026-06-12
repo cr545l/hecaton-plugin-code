@@ -194,6 +194,48 @@ async function createFolder(dirPath) {
   return { ok: true };
 }
 
+async function renamePath(fromPath, toPath) {
+  const result = await rpc('fs.rename', { from_path: fromPath, to_path: toPath });
+  if (!result || result.ok === false || result.error) {
+    return { ok: false, error: (result && result.error) || 'Cannot rename' };
+  }
+  return { ok: true };
+}
+
+async function copyPath(fromPath, toPath, recursive) {
+  const result = await rpc('fs.copy', { from_path: fromPath, to_path: toPath, recursive: !!recursive });
+  if (!result || result.ok === false || result.error) {
+    return { ok: false, error: (result && result.error) || 'Cannot copy' };
+  }
+  return { ok: true };
+}
+
+async function deletePath(targetPath) {
+  const result = await rpc('fs.delete', { path: targetPath, recursive: true });
+  if (!result || result.ok === false || result.error) {
+    return { ok: false, error: (result && result.error) || 'Cannot delete' };
+  }
+  return { ok: true };
+}
+
+function splitFileName(name) {
+  const i = name.lastIndexOf('.');
+  if (i <= 0) return { stem: name, ext: '' };
+  return { stem: name.substring(0, i), ext: name.substring(i) };
+}
+
+async function uniqueCopyPath(srcPath, isDir) {
+  const dir = dirName(srcPath);
+  const name = baseName(srcPath);
+  const { stem, ext } = isDir ? { stem: name, ext: '' } : splitFileName(name);
+  for (let i = 1; i <= 99; i++) {
+    const suffix = i === 1 ? ' copy' : ' copy ' + i;
+    const candidate = joinPath(dir, stem + suffix + ext);
+    if (!(await statPath(candidate))) return candidate;
+  }
+  return '';
+}
+
 async function pickFolder() {
   const picked = await rpc('picker.folder', { default_path: state.root }).catch(() => null);
   if (picked && picked.path) return normalizePath(picked.path);
@@ -227,6 +269,10 @@ module.exports = {
   writeTextFile,
   createFile,
   createFolder,
+  renamePath,
+  copyPath,
+  deletePath,
+  uniqueCopyPath,
   pickFolder,
   setRoot,
 };

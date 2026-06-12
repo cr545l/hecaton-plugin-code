@@ -8,7 +8,8 @@ const {
   visibleSlice,
   sanitizeDisplayText,
 } = require('./text');
-const { getSelectionRanges, hasSelection, countFindMatches, canUndo, canRedo } = require('./editor');
+const { getSelectionRanges, hasSelection, countFindMatches, canUndo, canRedo, findBracketMatch } = require('./editor');
+const { getVisualLayout, visualRowCount, posToVisualRow, segmentAt, maxLineDisplayWidth } = require('./wrap');
 const { highlightLine, getLanguage } = require('./highlighter');
 const {
   CURSOR_PALETTE,
@@ -20,6 +21,7 @@ const {
   encodeSixel,
   encodeClearSixel,
 } = require('./sixel');
+const hostScroll = require('./scroll');
 
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
@@ -61,7 +63,7 @@ function render() {
   const editorW = layout.editorW;
   const gutterW = Math.max(3, String(state.editLines.length).length) + 1;
   const editorContentW = Math.max(1, editorW - gutterW - 3);
-  const hasEditorHScroll = layout.hasEditor && state.openPath && getMaxEditorScrollX(editorContentW) > 0;
+  const hasEditorHScroll = layout.hasEditor && state.openPath && !state.wordWrap && getMaxEditorScrollX(editorContentW) > 0;
   const bodyH = Math.max(1, bottomSepRow - bodyTop - (hasEditorHScroll ? 1 : 0));
   const editorHScrollRow = hasEditorHScroll ? bodyTop + bodyH : 0;
   const contentCol = activityW + 1;
@@ -116,9 +118,69 @@ function render() {
   }
   out.push(ansi.moveTo(bottomSepRow, 1) + renderActivityRail(bottomSepRow, BOX.T_RIGHT) + renderBottomSeparator(layout));
   out.push(ansi.moveTo(statusRow, 1) + renderActivityRail(statusRow) + renderStatus(contentCols));
+
+  // Host-owned scroll: emit overscan banks (off-screen buffer rows the host
+  // reveals during sub-cell scrolling) and in-band render acks in the same
+  // stdout write as the frame so the host applies them atomically, then
+  // collect the region definitions for the post-write RPC sync.
+  let hostScrollDefs = null;
+  if (hostScroll.isActive()) {
+    hostScrollDefs = [];
+    if (layout.hasTree && bodyH > 0) {
+      const regionW = Math.max(1, treeW - 1);
+      const off = state.treeScroll;
+      const bankTop = hostScroll.bankRow('tree');
+      // Bank rows live beyond the screen: write them only after the host has
+      // confirmed the region (enlarged buffer); earlier writes would clamp
+      // onto the bottom visible row.
+      if (hostScroll.isReady('tree')) {
+        const bank = [off - 1, off + bodyH, off + bodyH + 1];
+        for (let i = 0; i < 3; i++) {
+          out.push(ansi.reset + ansi.moveTo(bankTop + 1 + i, treeCol) + renderTreeRowAt(bank[i], regionW) + ansi.reset);
+        }
+        out.push(hostScroll.ackString('tree', off));
+      }
+      hostScrollDefs.push({
+        id: 'tree',
+        row: bodyTop - 1,
+        col: treeCol - 1,
+        width: regionW,
+        height: bodyH,
+        contentRows: state.treeEntries.length,
+        contentCols: regionW, // horizontal stays plugin-owned
+        overscanRow: bankTop,
+        off,
+      });
+    }
+    if (layout.hasEditor && state.openPath && bodyH > 0) {
+      const regionW = Math.max(1, editorW - 1);
+      const off = state.scrollY;
+      const bankTop = hostScroll.bankRow('editor');
+      if (hostScroll.isReady('editor')) {
+        const bank = [off - 1, off + bodyH, off + bodyH + 1];
+        for (let i = 0; i < 3; i++) {
+          out.push(ansi.reset + ansi.moveTo(bankTop + 1 + i, editorCol) + renderEditorRowAt(bank[i], regionW) + ansi.reset);
+        }
+        out.push(hostScroll.ackString('editor', off));
+      }
+      hostScrollDefs.push({
+        id: 'editor',
+        row: bodyTop - 1,
+        col: editorCol - 1,
+        width: regionW,
+        height: bodyH,
+        contentRows: editorTotalRows(),
+        contentCols: regionW, // horizontal stays plugin-owned (gutter fixed)
+        overscanRow: bankTop,
+        off,
+      });
+    }
+  }
+
   process.stdout.write(out.join(''));
   renderScrollbarOverlays();
   renderEditorCursorOverlay();
+  if (hostScrollDefs) hostScroll.syncRegions(hostScrollDefs);
 }
 
 function computePanelLayout(cols) {
@@ -153,6 +215,7 @@ function computePanelLayout(cols) {
 }
 
 function renderMinimized() {
+  hostScroll.syncRegions([]); // minimized: drop regions so wheel reaches the terminal
   const cols = Math.max(20, state.termCols || 80);
   const title = ' ' + (state.openName || baseName(state.root) || '');
   const marker = state.dirty ? ' *' : '';
@@ -340,7 +403,7 @@ function buildContentSeparator(width, aboveOffsets, belowOffsets) {
 
 function renderBottomSeparator(layout) {
   const leftPct = scrollPct(state.treeScroll, Math.max(0, state.treeEntries.length - state.layout.bodyH));
-  const rightPct = scrollPct(state.scrollY, Math.max(0, state.editLines.length - state.layout.bodyH));
+  const rightPct = scrollPct(state.scrollY, editorMaxVScroll(state.layout.bodyH));
   let line = colors.border;
   if (layout.hasTree) line += labelOnRule(layout.treeW, leftPct >= 0 ? leftPct + '%' : '');
   if (layout.dividerVisible) line += BOX.T_UP;
@@ -353,7 +416,7 @@ function renderBottomSeparator(layout) {
 function renderEditorHScrollbarRow(layout) {
   const contentW = getEditorContentWidth(layout.editorW);
   const maxScrollX = getMaxEditorScrollX(contentW);
-  const editorMaxY = Math.max(0, state.editLines.length - state.layout.bodyH);
+  const editorMaxY = editorMaxVScroll(state.layout.bodyH);
   const trackCols = getEditorHScrollbarTrackCols(layout.editorW, editorMaxY > 0);
   let line = '';
   if (layout.hasTree) line += ' '.repeat(layout.treeW);
@@ -394,9 +457,17 @@ function getEditorContentWidth(editorW) {
 }
 
 function getMaxEditorScrollX(contentW) {
-  let maxLineW = 0;
-  for (const line of state.editLines) maxLineW = Math.max(maxLineW, stringWidth(line));
-  return Math.max(0, maxLineW - contentW);
+  if (state.wordWrap) return 0;
+  return Math.max(0, maxLineDisplayWidth() - contentW);
+}
+
+function editorTotalRows() {
+  if (state.wordWrap && state.openPath) return visualRowCount();
+  return state.editLines.length;
+}
+
+function editorMaxVScroll(height) {
+  return Math.max(0, editorTotalRows() - height);
 }
 
 function useSixelScrollbars() {
@@ -406,8 +477,14 @@ function useSixelScrollbars() {
 function keepTreeCursorVisible(height) {
   const max = Math.max(0, state.treeEntries.length - 1);
   state.treeCursor = clamp(state.treeCursor, 0, max);
-  if (state.treeCursor < state.treeScroll) state.treeScroll = state.treeCursor;
-  if (state.treeCursor >= state.treeScroll + height) state.treeScroll = state.treeCursor - height + 1;
+  // Skip cursor-follow while the host drives the position (trackpad momentum);
+  // the pin clears as soon as the cursor itself moves.
+  const pinned = state.treeScrollPin !== undefined && state.treeScrollPin === state.treeCursor;
+  if (state.treeScrollPin !== undefined && state.treeScrollPin !== state.treeCursor) state.treeScrollPin = undefined;
+  if (!pinned) {
+    if (state.treeCursor < state.treeScroll) state.treeScroll = state.treeCursor;
+    if (state.treeCursor >= state.treeScroll + height) state.treeScroll = state.treeCursor - height + 1;
+  }
   state.treeScroll = clamp(state.treeScroll, 0, Math.max(0, state.treeEntries.length - height));
 }
 
@@ -425,32 +502,33 @@ function renderTreeLines(width, height) {
 
   for (let row = lines.length; row < height; row++) {
     const idx = state.treeScroll + row;
-    const entry = state.treeEntries[idx];
-    if (!entry) {
-      lines.push(' '.repeat(contentW) + renderScrollbarCell(row, height, state.treeScroll, maxScroll));
-      continue;
-    }
-
-    const selected = idx === state.treeCursor;
-    const open = entry.path === state.openPath;
-    const indent = '  '.repeat(Math.max(0, entry.depth));
-    const marker = entry.isDir ? (entry.expanded ? '- ' : '+ ') : '  ';
-    const nameColor = entry.isDir ? colors.treeDir : colors.treeFile;
-    const inlineReset = resetInlineStyle();
-    const openMark = open ? (selected ? '>' : colors.saved + '>' + inlineReset) : ' ';
-    const displayName = entry.name + (open && state.dirty ? '*' : '');
-    let line = openMark + indent + marker + (selected ? displayName : nameColor + displayName + inlineReset);
-    if (!entry.isDir && contentW > 28) {
-      const metaText = entry.size ? ' ' + formatSize(entry.size) : '';
-      const meta = selected ? metaText : colors.dim + metaText + inlineReset;
-      const free = contentW - stringWidth(displayName) - stringWidth(indent) - 5;
-      if (free > 8) line += meta;
-    }
-    line = fit(line, contentW);
-    if (selected) line = colors.selected + line + ansi.reset;
-    lines.push(line + renderScrollbarCell(row, height, state.treeScroll, maxScroll));
+    lines.push(renderTreeRowAt(idx, contentW) + renderScrollbarCell(row, height, state.treeScroll, maxScroll));
   }
   return lines.slice(0, height);
+}
+
+function renderTreeRowAt(idx, contentW) {
+  const entry = idx >= 0 ? state.treeEntries[idx] : null;
+  if (!entry) return ' '.repeat(contentW);
+
+  const selected = idx === state.treeCursor;
+  const open = entry.path === state.openPath;
+  const indent = '  '.repeat(Math.max(0, entry.depth));
+  const marker = entry.isDir ? (entry.expanded ? '- ' : '+ ') : '  ';
+  const nameColor = entry.isDir ? colors.treeDir : colors.treeFile;
+  const inlineReset = resetInlineStyle();
+  const openMark = open ? (selected ? '>' : colors.saved + '>' + inlineReset) : ' ';
+  const displayName = entry.name + (open && state.dirty ? '*' : '');
+  let line = openMark + indent + marker + (selected ? displayName : nameColor + displayName + inlineReset);
+  if (!entry.isDir && contentW > 28) {
+    const metaText = entry.size ? ' ' + formatSize(entry.size) : '';
+    const meta = selected ? metaText : colors.dim + metaText + inlineReset;
+    const free = contentW - stringWidth(displayName) - stringWidth(indent) - 5;
+    if (free > 8) line += meta;
+  }
+  line = fit(line, contentW);
+  if (selected) line = colors.selected + line + ansi.reset;
+  return line;
 }
 
 function keepEditorCursorVisible(editorW, height) {
@@ -459,6 +537,17 @@ function keepEditorCursorVisible(editorW, height) {
   state.cursorRow = clamp(state.cursorRow, 0, Math.max(0, state.editLines.length - 1));
   const line = state.editLines[state.cursorRow] || '';
   state.cursorCol = clamp(state.cursorCol, 0, line.length);
+
+  if (state.wordWrap && state.openPath) {
+    const cursorV = posToVisualRow(state.cursorRow, state.cursorCol);
+    if (!state.dragging && !state.scrollFreed) {
+      if (cursorV < state.scrollY) state.scrollY = cursorV;
+      if (cursorV >= state.scrollY + height) state.scrollY = cursorV - height + 1;
+    }
+    state.scrollY = clamp(state.scrollY, 0, editorMaxVScroll(height));
+    state.scrollX = 0;
+    return;
+  }
 
   if (!state.dragging && !state.scrollFreed) {
     if (state.cursorRow < state.scrollY) state.scrollY = state.cursorRow;
@@ -476,7 +565,6 @@ function keepEditorCursorVisible(editorW, height) {
 
 function renderEditorLines(width, height) {
   const lines = [];
-  const maxScroll = Math.max(0, state.editLines.length - height);
   const panelW = Math.max(1, width - 1);
   if (!state.openPath) {
     const messages = [
@@ -490,24 +578,47 @@ function renderEditorLines(width, height) {
     return lines;
   }
 
-  const gutterW = state.layout.gutterW;
-  const contentW = Math.max(1, panelW - gutterW - 2);
-  for (let row = 0; row < height; row++) {
-    const lineIdx = state.scrollY + row;
-    if (lineIdx >= state.editLines.length) {
-      lines.push(fit(colors.lineNo + ' '.repeat(gutterW) + ' \u2502' + ansi.reset, panelW) +
-        renderScrollbarCell(row, height, state.scrollY, maxScroll));
-      continue;
-    }
+  bracketMatch = findBracketMatch();
+  const maxScroll = editorMaxVScroll(height);
 
-    const lineNo = String(lineIdx + 1).padStart(gutterW - 1, ' ') + ' ';
-    const gutter = colors.lineNo + lineNo + '\u2502' + ansi.reset + ' ';
-    let content = renderCodeContent(lineIdx, contentW);
-    let full = gutter + content;
-    full = fit(full, panelW);
-    lines.push(full + renderScrollbarCell(row, height, state.scrollY, maxScroll));
+  for (let row = 0; row < height; row++) {
+    lines.push(renderEditorRowAt(state.scrollY + row, panelW) +
+      renderScrollbarCell(row, height, state.scrollY, maxScroll));
   }
   return lines;
+}
+
+function renderEditorRowAt(absIdx, panelW) {
+  const gutterW = state.layout.gutterW;
+  const contentW = Math.max(1, panelW - gutterW - 2);
+  const blank = fit(colors.lineNo + ' '.repeat(gutterW) + ' \u2502' + ansi.reset, panelW);
+  if (absIdx < 0) return blank;
+
+  if (state.wordWrap) {
+    const seg = getVisualLayout().segments[absIdx];
+    if (!seg) return blank;
+    const lineNo = seg.startCol === 0
+      ? String(seg.row + 1).padStart(gutterW - 1, ' ') + ' '
+      : ' '.repeat(gutterW);
+    const gutter = colors.lineNo + lineNo + '\u2502' + ansi.reset + ' ';
+    return fit(gutter + renderCodeSegment(seg.row, seg.startCol, seg.endCol, contentW), panelW);
+  }
+
+  if (absIdx >= state.editLines.length) return blank;
+  const lineNo = String(absIdx + 1).padStart(gutterW - 1, ' ') + ' ';
+  const gutter = colors.lineNo + lineNo + '\u2502' + ansi.reset + ' ';
+  return fit(gutter + renderCodeContent(absIdx, contentW), panelW);
+}
+
+let bracketMatch = null;
+
+function bracketColsForLine(lineIdx) {
+  if (!bracketMatch) return [];
+  const cols = [];
+  for (const pos of bracketMatch) {
+    if (pos.row === lineIdx) cols.push(pos.col);
+  }
+  return cols;
 }
 
 function renderCodeContent(lineIdx, width) {
@@ -518,15 +629,32 @@ function renderCodeContent(lineIdx, width) {
   const leading = ' '.repeat(slice.leftPad);
   const selected = selectionTouchesLine(lineIdx);
   const findRanges = state.findQuery ? findRangesForLine(lineIdx) : [];
-  const found = findRanges.length > 0;
+  const brackets = bracketColsForLine(lineIdx);
   const highlightedLine = highlightLine(displayLine, state.openPath);
   const highlighted = sliceAnsiPlainRange(highlightedLine, slice.start, slice.start + segment.length);
 
-  if (selected || found) {
-    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start, findRanges), width);
+  if (selected || findRanges.length || brackets.length) {
+    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start, findRanges, brackets), width);
   }
 
   return fit(leading + highlighted, width);
+}
+
+function renderCodeSegment(lineIdx, startCol, endCol, width) {
+  const raw = state.editLines[lineIdx] || '';
+  const displayLine = sanitizeDisplayText(raw);
+  const segment = displayLine.substring(startCol, endCol);
+  const selected = selectionTouchesLine(lineIdx);
+  const findRanges = state.findQuery ? findRangesForLine(lineIdx) : [];
+  const brackets = bracketColsForLine(lineIdx);
+  const highlightedLine = highlightLine(displayLine, state.openPath);
+  const highlighted = sliceAnsiPlainRange(highlightedLine, startCol, endCol);
+
+  if (selected || findRanges.length || brackets.length) {
+    return fit(renderMarkedHighlighted(highlighted, segment, lineIdx, startCol, findRanges, brackets), width);
+  }
+
+  return fit(highlighted, width);
 }
 
 function sliceAnsiPlainRange(highlighted, startChar, endChar) {
@@ -578,7 +706,7 @@ function isFindMatch(col, ranges) {
   return ranges.some(r => col >= r.start && col < r.end);
 }
 
-function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar, findRanges) {
+function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar, findRanges, brackets) {
   const selections = getSelectionRanges();
   let out = '';
   let plainOffset = 0;
@@ -599,8 +727,10 @@ function renderMarkedHighlighted(highlighted, segment, lineIdx, startChar, findR
     const absolute = startChar + plainOffset;
     const selected = selections.some(sel => isSelected(lineIdx, absolute, sel));
     const found = !selected && isFindMatch(absolute, findRanges || []);
+    const bracket = !selected && !found && brackets && brackets.indexOf(absolute) >= 0;
     if (selected) out += ansi.inverse + ch + ansi.noInverse;
     else if (found) out += ansi.underline + ch + ansi.noUnderline;
+    else if (bracket) out += ansi.bold + ansi.underline + ch + ansi.noUnderline + ansi.noBold;
     else out += ch;
     i += ch.length;
     plainOffset += ch.length;
@@ -624,9 +754,18 @@ function renderEditorCursorOverlay() {
   const sixel = pixels ? encodeSixel(pixels, state.cellW, state.cellH, CURSOR_PALETTE) : '';
 
   for (const sel of selections) {
-    const cursorDisplayCol = stringWidth((state.editLines[sel.row] || '').substring(0, sel.col));
-    const row = layout.bodyTop + (sel.row - state.scrollY);
-    const col = layout.editorCol + gutterW + 2 + (cursorDisplayCol - state.scrollX);
+    let row, col;
+    if (state.wordWrap) {
+      const v = posToVisualRow(sel.row, sel.col);
+      const seg = segmentAt(v);
+      row = layout.bodyTop + (v - state.scrollY);
+      col = layout.editorCol + gutterW + 2 +
+        stringWidth((state.editLines[sel.row] || '').substring(seg.startCol, sel.col));
+    } else {
+      const cursorDisplayCol = stringWidth((state.editLines[sel.row] || '').substring(0, sel.col));
+      row = layout.bodyTop + (sel.row - state.scrollY);
+      col = layout.editorCol + gutterW + 2 + (cursorDisplayCol - state.scrollX);
+    }
     const visible = row >= layout.bodyTop &&
       row < layout.bodyTop + layout.bodyH &&
       col >= layout.editorCol + gutterW + 2 &&
@@ -673,6 +812,7 @@ function renderEditorStatusInfo() {
   if (hasSelection()) parts.push(selectionSummary());
   if (state.undoStack.length || state.redoStack.length) parts.push('U ' + state.undoStack.length + ' R ' + state.redoStack.length);
   if (state.findQuery) parts.push('Find ' + countFindMatches(state.findQuery));
+  if (state.wordWrap) parts.push('wrap');
   if (state.readonly) parts.push('readonly');
   if (state.binary) parts.push('binary');
   if (state.fileSizeBytes) parts.push(formatSize(state.fileSizeBytes));
@@ -746,7 +886,7 @@ function renderScrollbarOverlays() {
   }
 
   if (!state.editorCollapsed && state.openPath) {
-    const editorMaxY = Math.max(0, state.editLines.length - bodyH);
+    const editorMaxY = editorMaxVScroll(bodyH);
     const contentW = getEditorContentWidth(layout.editorW);
     const maxScrollX = getMaxEditorScrollX(contentW);
     const hTrackCols = getEditorHScrollbarTrackCols(layout.editorW, editorMaxY > 0);

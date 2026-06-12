@@ -11,6 +11,7 @@
 
 const { state, init: initState, setStatus } = require('./state');
 const { render } = require('./render');
+const hostScroll = require('./scroll');
 const {
   normalizePath,
   dirName,
@@ -171,6 +172,7 @@ async function main() {
   setupEvents();
   setupInput();
   await initState();
+  hostScroll.init({ render });
 
   const cell = await hecaton.window.get_cell_size().catch(() => null);
   if (cell && cell.cell_width && cell.cell_height) {

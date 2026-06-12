@@ -12,6 +12,7 @@ const state = {
   treeEntries: [],
   treeCursor: 0,
   treeScroll: 0,
+  treeScrollPin: undefined,
   focus: 'tree',
   treeCollapsed: false,
   editorCollapsed: false,
@@ -65,6 +66,11 @@ const state = {
 
   findQuery: '',
   findCaseSensitive: false,
+  replaceText: '',
+  tabSize: 2,
+  indentWithTabs: false,
+  wordWrap: false,
+  docVersion: 0,
 
   pendingDialog: null,
   pendingOpenPath: '',
