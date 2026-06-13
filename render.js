@@ -37,7 +37,7 @@ function resetInlineStyle() {
   return ansi.noBold + ansi.noItalic + ansi.noUnderline + ansi.noInverse + ansi.fg.default + ansi.bg.default;
 }
 
-const ACTIVITY_BAR_W = 8;
+const ACTIVITY_BAR_W = 0;
 const BOX = {
   H: '\u2500',
   V: '\u2502',

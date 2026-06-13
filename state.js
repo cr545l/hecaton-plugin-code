@@ -82,9 +82,9 @@ const state = {
   hoveredAction: '',
 
   layout: {
-    activityW: 8,
-    contentCol: 9,
-    treeCol: 9,
+    activityW: 0,
+    contentCol: 1,
+    treeCol: 1,
     treeW: 23,
     editorW: 48,
     bodyTop: 3,
