@@ -99,25 +99,28 @@ function render() {
 
   const out = [];
   out.push(ansi.clear + ansi.hideCursor);
-  out.push(ansi.moveTo(1, 1) + renderActivityRail(1) + renderTitle(contentCols));
-  out.push(ansi.moveTo(sepRow, 1) + renderActivityRail(sepRow, BOX.T_RIGHT) + renderSeparator(layout));
+  out.push(ansi.moveTo(1, 1) + ansi.reset + renderActivityRail(1) + renderTitle(contentCols));
+  out.push(ansi.moveTo(sepRow, 1) + ansi.reset + renderActivityRail(sepRow, BOX.T_RIGHT) + renderSeparator(layout));
 
   const treeLines = layout.hasTree ? renderTreeLines(treeW, bodyH) : [];
   const editorLines = layout.hasEditor ? renderEditorLines(editorW, bodyH) : [];
   for (let i = 0; i < bodyH; i++) {
-    let line = ansi.moveTo(bodyTop + i, 1);
+    let line = ansi.moveTo(bodyTop + i, 1) + ansi.reset;
     line += renderActivityRail(bodyTop + i);
+    line += ansi.reset;
     if (layout.hasTree) line += treeLines[i];
+    line += ansi.reset;
     if (layout.dividerVisible) line += colors.border + '\u2502' + ansi.reset;
     if (layout.hasEditor) line += editorLines[i];
+    line += ansi.reset;
     out.push(line);
   }
 
   if (hasEditorHScroll) {
-    out.push(ansi.moveTo(editorHScrollRow, 1) + renderActivityRail(editorHScrollRow) + renderEditorHScrollbarRow(layout));
+    out.push(ansi.moveTo(editorHScrollRow, 1) + ansi.reset + renderActivityRail(editorHScrollRow) + ansi.reset + renderEditorHScrollbarRow(layout) + ansi.reset);
   }
-  out.push(ansi.moveTo(bottomSepRow, 1) + renderActivityRail(bottomSepRow, BOX.T_RIGHT) + renderBottomSeparator(layout));
-  out.push(ansi.moveTo(statusRow, 1) + renderActivityRail(statusRow) + renderStatus(contentCols));
+  out.push(ansi.moveTo(bottomSepRow, 1) + ansi.reset + renderActivityRail(bottomSepRow, BOX.T_RIGHT) + renderBottomSeparator(layout));
+  out.push(ansi.moveTo(statusRow, 1) + ansi.reset + renderActivityRail(statusRow) + renderStatus(contentCols));
 
   // Host-owned scroll: emit overscan banks (off-screen buffer rows the host
   // reveals during sub-cell scrolling) and in-band render acks in the same
@@ -573,7 +576,7 @@ function renderEditorLines(width, height) {
       '',
     ];
     for (let i = 0; i < height; i++) {
-      lines.push(fit(colors.dim + (messages[i] || '') + ansi.reset, panelW) + renderScrollbarCell(i, height, 0, 0));
+      lines.push(fit(colors.dim + (messages[i] || '') + ansi.reset, panelW) + ansi.reset + renderScrollbarCell(i, height, 0, 0));
     }
     return lines;
   }
@@ -582,7 +585,7 @@ function renderEditorLines(width, height) {
   const maxScroll = editorMaxVScroll(height);
 
   for (let row = 0; row < height; row++) {
-    lines.push(renderEditorRowAt(state.scrollY + row, panelW) +
+    lines.push(renderEditorRowAt(state.scrollY + row, panelW) + ansi.reset +
       renderScrollbarCell(row, height, state.scrollY, maxScroll));
   }
   return lines;
@@ -634,7 +637,7 @@ function renderCodeContent(lineIdx, width) {
   const highlighted = sliceAnsiPlainRange(highlightedLine, slice.start, slice.start + segment.length);
 
   if (selected || findRanges.length || brackets.length) {
-    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start, findRanges, brackets), width);
+    return fit(leading + renderMarkedHighlighted(highlighted, segment, lineIdx, slice.start, findRanges, brackets) + resetInlineStyle(), width);
   }
 
   return fit(leading + highlighted, width);
@@ -651,7 +654,7 @@ function renderCodeSegment(lineIdx, startCol, endCol, width) {
   const highlighted = sliceAnsiPlainRange(highlightedLine, startCol, endCol);
 
   if (selected || findRanges.length || brackets.length) {
-    return fit(renderMarkedHighlighted(highlighted, segment, lineIdx, startCol, findRanges, brackets), width);
+    return fit(renderMarkedHighlighted(highlighted, segment, lineIdx, startCol, findRanges, brackets) + resetInlineStyle(), width);
   }
 
   return fit(highlighted, width);
